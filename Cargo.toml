@@ -1,0 +1,79 @@
+[package]
+name = "nextreq"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A next-generation, Rust-powered, batteries-included HTTP client for Python"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/nextreq/nextreq"
+keywords = ["http", "client", "python", "pyo3", "async"]
+categories = ["web-programming::http-client"]
+publish = false
+autobenches = false
+autoexamples = false
+
+[lib]
+name = "_nextreq"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[features]
+default = []
+# HTTP/3 (QUIC) support. reqwest still gates this behind an unstable cfg, so it
+# must be built with: RUSTFLAGS="--cfg reqwest_unstable" maturin develop -F http3
+http3 = ["reqwest/http3"]
+
+[dependencies]
+# abi3-py310: one wheel for CPython 3.10 - 3.14.
+# abi3t-py315: PEP 803 stable ABI, importable on free-threaded (no-GIL) 3.15+.
+pyo3 = { version = "0.30", features = ["abi3-py310", "abi3t-py315"] }
+pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "net"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "http2",
+    "gzip",
+    "deflate",
+    "brotli",
+    "zstd",
+    "socks",
+    "rustls-no-provider",
+] }
+hyper = { version = "1", default-features = false }
+http = "1"
+http-body = "1"
+bytes = "1"
+tower-layer = "0.3"
+tower-service = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+webpki-roots = "1"
+httpdate = "1"
+fastrand = "2"
+
+[dev-dependencies]
+# Only used by the benchmark target server (benches/server.rs).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
+
+[build-dependencies]
+pyo3-build-config = "0.30"
+
+[[example]]
+name = "bench_server"
+path = "benches/server.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+panic = "unwind"

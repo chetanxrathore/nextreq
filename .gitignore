@@ -1,0 +1,14 @@
+/target
+/.venv
+/dist
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.dylib
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+*.egg-info/
+benches/.results/
