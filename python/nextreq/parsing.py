@@ -21,6 +21,7 @@ import decimal
 import enum
 import importlib
 import json
+import sys
 import types
 import typing
 import uuid
@@ -77,6 +78,33 @@ def _is_msgspec_struct(tp: Any) -> bool:
 _FIELD_CACHE: dict[type, list[tuple[str, Any, bool]]] = {}
 
 
+def _resolve_hints_individually(cls: type) -> dict[str, Any]:
+    """Fallback for when ``get_type_hints`` fails as a whole.
+
+    That happens when *one* annotation cannot be resolved - typically a class
+    defined inside a function while ``from __future__ import annotations`` is
+    active. Resolve what we can field by field; only the unresolvable fields
+    fall back to ``Any`` (i.e. are passed through unvalidated).
+    """
+    module = sys.modules.get(cls.__module__)
+    namespace: dict[str, Any] = dict(vars(typing))
+    if module is not None:
+        namespace.update(vars(module))
+    namespace[cls.__name__] = cls
+    hints: dict[str, Any] = {}
+    for field in dataclasses.fields(cls):
+        annotation: Any = field.type
+        if isinstance(annotation, str):
+            try:
+                # The string is source code from the model's own module (the
+                # same thing typing.get_type_hints evaluates), never user data.
+                annotation = eval(annotation, namespace)
+            except Exception:
+                annotation = Any
+        hints[field.name] = annotation
+    return hints
+
+
 def _dataclass_fields(cls: type) -> list[tuple[str, Any, bool]]:
     """``(name, resolved_type, required)`` for each init field of a dataclass."""
     cached = _FIELD_CACHE.get(cls)
@@ -84,7 +112,7 @@ def _dataclass_fields(cls: type) -> list[tuple[str, Any, bool]]:
         try:
             hints = typing.get_type_hints(cls)
         except Exception:
-            hints = {}
+            hints = _resolve_hints_individually(cls)
         cached = []
         for field in dataclasses.fields(cls):
             if not field.init:
