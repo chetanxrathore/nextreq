@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import importlib.metadata
 import io
 import signal
 import sys
@@ -11,6 +12,7 @@ import time
 from typing import Any
 
 import pytest
+from packaging.version import Version
 
 import nextreq
 from nextreq import URL, Cookies, Headers, Request, Response
@@ -21,7 +23,11 @@ from .conftest import COMPRESSIBLE, LiveServer, TLSServer, brotli_compress, zstd
 
 
 def test_version_and_exports() -> None:
-    assert nextreq.__version__ == "0.1.0"
+    # The version is defined once, in Cargo.toml. Compare against the installed
+    # package metadata instead of a number hardcoded here, so a release bump
+    # cannot break the suite.
+    assert Version(nextreq.__version__) == Version(importlib.metadata.version("nextreq"))
+    assert Version(nextreq.__version__) >= Version("0.1.0")
     for name in nextreq.__all__:
         assert hasattr(nextreq, name), name
     assert isinstance(nextreq.HTTP3_ENABLED, bool)

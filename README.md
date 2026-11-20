@@ -35,7 +35,7 @@ print(r.json(), r.http_version, r.elapsed.total)
   zstd decoding, proxies, optional HTTP/3.
 - **Zero mandatory dependencies.** Python 3.10+, one abi3 wheel per platform.
 
-> **Status:** `0.1.0` release candidate. The API is small and tested (311 Python tests,
+> **Status:** early release (`0.1.x`). The API is small and tested (311 Python tests,
 > 40 Rust tests; the suite also passes on Python 3.10 against the abi3 wheel, and a
 > threaded smoke test passes on free-threaded CPython 3.14t) but young - see
 > [Limitations](#limitations).
@@ -443,7 +443,7 @@ with ThreadPoolExecutor(max_workers=20) as pool:
 
 ## Limitations
 
-Known gaps in `0.1.0`, in rough priority order:
+Known gaps in the `0.1` series, in rough priority order:
 
 - **Uploads are buffered.** `content=` accepts an iterable of bytes but joins it in
   memory first; multipart bodies are built in memory too.
