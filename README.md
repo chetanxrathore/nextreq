@@ -348,61 +348,61 @@ overhead (no internet jitter). Everything here is produced by
 data are in [`benches/RESULTS.md`](benches/RESULTS.md).
 
 <!-- BENCHMARKS:START -->
-_Apple M2 Max · CPython 3.14.6 · nextreq 0.1.1 vs requests 2.34.2, httpx 0.28.1, aiohttp 3.14.5 · 2026-11-20 23:02 UTC. "nextreq speedup" is nextreq's throughput divided by that library's._
+_Apple M2 Max · CPython 3.14.6 · nextreq 0.2.0 vs requests 2.34.2, httpx 0.28.1, aiohttp 3.14.5 · 2026-11-20 23:30 UTC. "nextreq speedup" is nextreq's throughput divided by that library's._
 
 **1. Sequential sync GETs** - 500 GET requests for a small JSON document, one after another, over a single keep-alive connection.
 
 | Library | Requests/sec | nextreq speedup | p50 (ms) | p95 (ms) | p99 (ms) | Peak RSS (MB) |
 |---|---:|---:|---:|---:|---:|---:|
-| **nextreq** | 22,016 | baseline | 0.044 | 0.056 | 0.065 | 43.5 |
-| aiohttp (awaited sequentially) | 12,519 | 1.76× | 0.078 | 0.089 | 0.097 | 52.4 |
-| httpx | 5,081 | 4.33× | 0.194 | 0.215 | 0.418 | 67.5 |
-| requests | 2,688 | 8.19× | 0.362 | 0.416 | 0.481 | 49.3 |
+| **nextreq** | 22,174 | baseline | 0.044 | 0.055 | 0.064 | 43.5 |
+| aiohttp (awaited sequentially) | 12,695 | 1.75× | 0.078 | 0.089 | 0.094 | 52.4 |
+| httpx | 5,116 | 4.33× | 0.189 | 0.219 | 0.400 | 66.8 |
+| requests | 2,812 | 7.89× | 0.355 | 0.375 | 0.396 | 48.9 |
 
 **2. High-concurrency async fan-out** - 1000 GET requests with at most 50 in flight.
 
 | Library | Requests/sec | nextreq speedup | p50 (ms) | p95 (ms) | p99 (ms) | Peak RSS (MB) |
 |---|---:|---:|---:|---:|---:|---:|
-| **nextreq (client.gather)** | 79,389 | — | 0.229 | 0.388 | 0.431 | 50.2 |
-| **nextreq (asyncio.gather + Semaphore)** | 61,095 | baseline | 0.500 | 0.937 | 1.24 | 49.4 |
-| aiohttp | 23,978 | 2.55× | 1.24 | 1.93 | 2.25 | 54.6 |
-| requests (thread pool) | 3,216 | 18.99× | 14.0 | 28.7 | 35.5 | 54.0 |
-| httpx | 602 | 101.49× | 56.2 | 226 | 330 | 73.6 |
+| **nextreq (client.gather)** | 79,980 | — | 0.221 | 0.417 | 0.481 | 49.7 |
+| **nextreq (asyncio.gather + Semaphore)** | 61,049 | baseline | 0.523 | 1.00 | 1.25 | 50.6 |
+| aiohttp | 24,549 | 2.49× | 1.21 | 1.89 | 2.23 | 54.3 |
+| requests (thread pool) | 3,279 | 18.62× | 13.7 | 26.3 | 33.4 | 53.6 |
+| httpx | 605 | 100.84× | 58.1 | 220 | 334 | 72.2 |
 
 **3. Typed JSON deserialization** - 500 GET requests for a ~1.3 kB JSON document, each validated into a Pydantic v2 model (nested models, a list of 10 sub-objects, a datetime).
 
 | Library | Requests/sec | nextreq speedup | p50 (ms) | p95 (ms) | p99 (ms) | Peak RSS (MB) |
 |---|---:|---:|---:|---:|---:|---:|
-| **nextreq** | 16,686 | baseline | 0.058 | 0.069 | 0.076 | 54.6 |
-| aiohttp (awaited sequentially) | 9,511 | 1.75× | 0.105 | 0.116 | 0.125 | 62.6 |
-| httpx | 3,920 | 4.26× | 0.252 | 0.275 | 0.445 | 76.0 |
-| requests | 2,509 | 6.65× | 0.395 | 0.427 | 0.457 | 61.4 |
+| **nextreq** | 16,509 | baseline | 0.059 | 0.071 | 0.078 | 54.7 |
+| aiohttp (awaited sequentially) | 9,576 | 1.72× | 0.104 | 0.114 | 0.123 | 62.8 |
+| httpx | 4,043 | 4.08× | 0.244 | 0.263 | 0.447 | 76.1 |
+| requests | 2,614 | 6.32× | 0.380 | 0.403 | 0.428 | 60.5 |
 
 **4. SSE streaming throughput** - A stream of 10000 Server-Sent Events, consumed into event objects (event, data, id, retry).
 
 | Library | Events/sec | nextreq speedup | Time per stream (ms) | Peak RSS (MB) |
 |---|---:|---:|---:|---:|
-| **nextreq** | 2,986,561 | baseline | 3.35 | 44.8 |
-| requests + hand-written parser | 882,408 | 3.38× | 11.3 | 49.0 |
-| httpx + hand-written parser | 821,055 | 3.64× | 12.2 | 68.1 |
-| aiohttp + hand-written parser | 192,447 | 15.52× | 52.0 | 52.8 |
+| **nextreq** | 2,963,915 | baseline | 3.37 | 44.0 |
+| requests + hand-written parser | 898,610 | 3.30× | 11.1 | 48.9 |
+| httpx + hand-written parser | 825,545 | 3.59× | 12.1 | 67.0 |
+| aiohttp + hand-written parser | 196,637 | 15.07× | 50.9 | 52.7 |
 
 **5. Large payload downloads (bonus)** - 100 sequential GET requests, each downloading a 1 MiB body.
 
 | Library | Requests/sec | nextreq speedup | p50 (ms) | p95 (ms) | p99 (ms) | Peak RSS (MB) |
 |---|---:|---:|---:|---:|---:|---:|
-| **nextreq** | 5,356 | baseline | 0.178 | 0.243 | 0.347 | 50.9 |
-| aiohttp (awaited sequentially) | 4,664 | 1.15× | 0.212 | 0.238 | 0.255 | 57.4 |
-| httpx | 1,688 | 3.17× | 0.591 | 0.634 | 0.907 | 141.4 |
-| requests | 1,244 | 4.31× | 0.794 | 0.874 | 1.10 | 52.2 |
+| **nextreq** | 5,478 | baseline | 0.178 | 0.219 | 0.235 | 50.5 |
+| aiohttp (awaited sequentially) | 4,723 | 1.16× | 0.209 | 0.231 | 0.246 | 54.4 |
+| httpx | 1,742 | 3.14× | 0.571 | 0.623 | 0.818 | 136.9 |
+| requests | 1,273 | 4.30× | 0.787 | 0.825 | 0.863 | 52.0 |
 
 **Takeaways**
 
-- **Sequential sync GETs:** nextreq handles 22,016 req/s at a p50 of 0.044 ms - **8.2×** requests, **4.3×** httpx, **1.8×** aiohttp.
-- **Async fan-out:** with the same `asyncio.gather` + `Semaphore` harness nextreq reaches 61,095 req/s - **2.5×** aiohttp, **101.5×** httpx, **19.0×** requests. The built-in `client.gather()` reaches 79,389 req/s (1.30× the asyncio.gather harness, 3.3× aiohttp).
-- **Typed JSON:** `client.get(url, model=User)` (bytes validated straight into the model by pydantic-core) is **6.7×** requests, **4.3×** httpx, **1.8×** aiohttp doing `User.model_validate(response.json())`.
-- **SSE:** the Rust parser delivers 2,986,561 events/s as ready-made `SSEEvent` objects - **3.4×** requests, **3.6×** httpx, **15.5×** aiohttp with a hand-written Python parser.
-- **Large downloads:** for 1 MiB bodies, where memory copies rather than per-request overhead dominate, nextreq is **4.3×** requests, **3.2×** httpx, **1.1×** aiohttp.
+- **Sequential sync GETs:** nextreq handles 22,174 req/s at a p50 of 0.044 ms - **7.9×** requests, **4.3×** httpx, **1.7×** aiohttp.
+- **Async fan-out:** with the same `asyncio.gather` + `Semaphore` harness nextreq reaches 61,049 req/s - **2.5×** aiohttp, **100.8×** httpx, **18.6×** requests. The built-in `client.gather()` reaches 79,980 req/s (1.31× the asyncio.gather harness, 3.3× aiohttp).
+- **Typed JSON:** `client.get(url, model=User)` (bytes validated straight into the model by pydantic-core) is **6.3×** requests, **4.1×** httpx, **1.7×** aiohttp doing `User.model_validate(response.json())`.
+- **SSE:** the Rust parser delivers 2,963,915 events/s as ready-made `SSEEvent` objects - **3.3×** requests, **3.6×** httpx, **15.1×** aiohttp with a hand-written Python parser.
+- **Large downloads:** for 1 MiB bodies, where memory copies rather than per-request overhead dominate, nextreq is **4.3×** requests, **3.1×** httpx, **1.2×** aiohttp.
 - **Memory:** nextreq's peak RSS stays between 44 and 55 MB across scenarios (interpreter included); see each table for the per-library comparison.
 <!-- BENCHMARKS:END -->
 

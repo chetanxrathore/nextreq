@@ -6,8 +6,8 @@ nextreq is pre-1.0. Security fixes are released for the latest minor version onl
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | yes       |
-| < 0.1   | no        |
+| 0.2.x   | yes       |
+| < 0.2   | no        |
 
 ## Reporting a vulnerability
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-11-20
 
 This release removes most of the limitations listed for 0.1.
 
