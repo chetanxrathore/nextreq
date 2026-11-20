@@ -180,14 +180,19 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      id-token: write # trusted publishing
+      id-token: write # trusted publishing + signing the provenance attestations
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
           merge-multiple: true
           path: dist
-      - uses: PyO3/maturin-action@v1
+      # PyPA's publisher (rather than `maturin upload`) because it generates a
+      # signed PEP 740 provenance attestation for every file, which is what
+      # PyPI shows as "provenance" and what lets users verify that a wheel was
+      # built by this workflow from this repository.
+      - uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          command: upload
-          args: --non-interactive --skip-existing dist/*
+          packages-dir: dist
+          attestations: true
+          skip-existing: true
