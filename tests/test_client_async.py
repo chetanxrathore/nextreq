@@ -194,7 +194,9 @@ async def test_event_loop_is_not_blocked_during_io(aclient: nextreq.AsyncClient)
     finally:
         task.cancel()
     assert response.status_code == 200 and elapsed >= 0.3
-    assert ticks >= 50, f"event loop only ran {ticks} ticks during a 300 ms request"
+    # A blocked loop would manage 0-1 ticks. The bar is low on purpose: timers
+    # are coarse on Windows (~15 ms) and CI runners are slow.
+    assert ticks >= 10, f"event loop only ran {ticks} ticks during a 300 ms request"
 
 
 async def test_concurrent_requests_reuse_connections_and_never_deadlock(

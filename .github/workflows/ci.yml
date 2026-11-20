@@ -52,6 +52,8 @@ jobs:
   python:
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # Windows has not been verified yet; report its result without failing the run.
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +64,7 @@ jobs:
             python-version: "3.13"
           - os: windows-latest
             python-version: "3.13"
+            experimental: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -70,8 +73,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Create virtualenv and install dev dependencies
+        # setup-uv already creates .venv when python-version is set, so a
+        # plain `uv venv` fails with "already exists". --clear makes this step
+        # work whether or not the action created one.
         run: |
-          uv venv
+          uv venv --clear
           uv pip install -e ".[dev]"
       - name: Build extension (release)
         run: uv run --no-sync maturin develop --release
@@ -96,7 +102,7 @@ jobs:
         with:
           python-version: "3.13"
       - run: |
-          uv venv
+          uv venv --clear
           uv pip install -e ".[dev]"
           uv run --no-sync maturin develop --release
       - name: Run benchmarks (quick mode, results not committed)

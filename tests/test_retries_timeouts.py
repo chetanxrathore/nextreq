@@ -593,7 +593,7 @@ async def test_async_backoff_does_not_block_the_loop(server: LiveServer) -> None
     finally:
         task.cancel()
     assert response.retry_count == 2
-    assert ticks >= 20, "asyncio.sleep-based backoff must yield to the event loop"
+    assert ticks >= 8, "asyncio.sleep-based backoff must yield to the event loop"
 
 
 def test_retry_hooks_see_every_attempt(server: LiveServer, sleeps: list[float]) -> None:

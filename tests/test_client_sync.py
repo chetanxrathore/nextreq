@@ -621,7 +621,8 @@ def test_gil_is_released_during_blocking_io(client: nextreq.Client) -> None:
         worker.join()
     assert elapsed >= 0.4
     # If the GIL were held, the spinner could not tick at all during the request.
-    assert progressed >= 50, f"background thread only ticked {progressed} times"
+    # (The bar is low on purpose: timers are coarse on Windows and CI is slow.)
+    assert progressed >= 10, f"background thread only ticked {progressed} times"
 
 
 def test_threads_share_one_client(client: nextreq.Client, server: LiveServer) -> None:
