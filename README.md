@@ -50,7 +50,7 @@ pip install "nextreq[pydantic]"    # optional extras: pydantic, msgspec, otel
 From source (needs a Rust toolchain):
 
 ```bash
-git clone https://github.com/nextreq/nextreq && cd nextreq
+git clone https://github.com/chetanxrathore/nextreq && cd nextreq
 uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 maturin develop --release

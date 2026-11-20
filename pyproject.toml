@@ -56,7 +56,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/nextreq/nextreq"
+Repository = "https://github.com/chetanxrathore/nextreq"
 
 [tool.maturin]
 python-source = "python"

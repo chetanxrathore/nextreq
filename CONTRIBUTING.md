@@ -9,7 +9,7 @@ You need a Rust toolchain (stable, with `rustfmt` and `clippy`) and Python 3.10+
 [`uv`](https://docs.astral.sh/uv/) is recommended but plain `venv` + `pip` works.
 
 ```bash
-git clone https://github.com/nextreq/nextreq
+git clone https://github.com/chetanxrathore/nextreq
 cd nextreq
 
 uv venv                          # or: python3 -m venv .venv
