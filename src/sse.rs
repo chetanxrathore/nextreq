@@ -18,8 +18,11 @@
 
 use std::sync::Mutex;
 
+use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyBytes, PyList, PyString, PyTuple};
+use pyo3::IntoPyObjectExt;
 
 /// One dispatched event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +31,25 @@ pub struct SseEvent {
     pub data: String,
     pub id: Option<String>,
     pub retry: Option<u64>,
+}
+
+/// Receives events as they are dispatched by [`SseDecoder`].
+///
+/// Events are handed over as borrowed string slices so a sink can build its
+/// final representation (e.g. Python objects) without intermediate copies.
+pub trait EventSink {
+    fn dispatch(&mut self, event: &str, data: &str, id: Option<&str>, retry: Option<u64>);
+}
+
+impl EventSink for Vec<SseEvent> {
+    fn dispatch(&mut self, event: &str, data: &str, id: Option<&str>, retry: Option<u64>) {
+        self.push(SseEvent {
+            event: event.to_owned(),
+            data: data.to_owned(),
+            id: id.map(str::to_owned),
+            retry,
+        });
+    }
 }
 
 /// Incremental event-stream decoder.
@@ -48,10 +70,6 @@ pub struct SseDecoder {
 }
 
 impl SseDecoder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// The last event ID seen on the stream (for `Last-Event-ID` on reconnect).
     pub fn last_event_id(&self) -> Option<&str> {
         self.last_event_id.as_deref()
@@ -63,7 +81,7 @@ impl SseDecoder {
     }
 
     /// Feed a chunk of the response body, appending dispatched events to `out`.
-    pub fn feed(&mut self, mut chunk: &[u8], out: &mut Vec<SseEvent>) {
+    pub fn feed<S: EventSink>(&mut self, mut chunk: &[u8], out: &mut S) {
         if self.pending_cr {
             if chunk.is_empty() {
                 return;
@@ -111,7 +129,7 @@ impl SseDecoder {
         self.block_retry = None;
     }
 
-    fn process_line(&mut self, mut line: &[u8], out: &mut Vec<SseEvent>) {
+    fn process_line<S: EventSink>(&mut self, mut line: &[u8], out: &mut S) {
         if !self.started {
             self.started = true;
             if line.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -168,56 +186,296 @@ impl SseDecoder {
         }
     }
 
-    fn dispatch(&mut self, out: &mut Vec<SseEvent>) {
+    fn dispatch<S: EventSink>(&mut self, out: &mut S) {
         let retry = self.block_retry.take();
         if !self.has_data {
             self.event.clear();
             return;
         }
         // Strip the single trailing LF added after the last data line.
-        if self.data.ends_with('\n') {
-            self.data.pop();
-        }
+        let data = self.data.strip_suffix('\n').unwrap_or(&self.data);
         let event = if self.event.is_empty() {
-            String::from("message")
+            "message"
         } else {
-            std::mem::take(&mut self.event)
+            self.event.as_str()
         };
-        out.push(SseEvent {
-            event,
-            data: std::mem::take(&mut self.data),
-            id: self.last_event_id.clone(),
-            retry,
-        });
+        out.dispatch(event, data, self.last_event_id.as_deref(), retry);
+        // Keep the allocations for the next event.
+        self.data.clear();
+        self.event.clear();
         self.has_data = false;
     }
 }
 
-/// Convert parsed events into a Python `list[tuple[str, str, str | None, int | None]]`.
-pub fn events_to_py<'py>(py: Python<'py>, events: Vec<SseEvent>) -> PyResult<Bound<'py, PyList>> {
-    let list = PyList::empty(py);
-    for ev in events {
-        let tuple = PyTuple::new(
+/// One Server-Sent Event, as exposed to Python (`nextreq.SSEEvent`).
+///
+/// Instances are created directly by the Rust parser, so iterating a stream
+/// costs no Python-level object construction. Fields are stored as ready-made
+/// Python strings, which makes attribute access a plain reference copy.
+#[pyclass(frozen, module = "nextreq", name = "SSEEvent")]
+pub struct PySseEvent {
+    event: Py<PyString>,
+    data: Py<PyString>,
+    id: Option<Py<PyString>>,
+    retry: Option<u64>,
+}
+
+impl PySseEvent {
+    fn id_str<'py>(&'py self, py: Python<'py>) -> PyResult<Option<&'py str>> {
+        match &self.id {
+            Some(id) => Ok(Some(id.bind(py).to_str()?)),
+            None => Ok(None),
+        }
+    }
+}
+
+#[pymethods]
+impl PySseEvent {
+    #[new]
+    #[pyo3(signature = (event = None, data = None, id = None, retry = None))]
+    fn py_new(
+        py: Python<'_>,
+        event: Option<Bound<'_, PyString>>,
+        data: Option<Bound<'_, PyString>>,
+        id: Option<Bound<'_, PyString>>,
+        retry: Option<u64>,
+    ) -> Self {
+        PySseEvent {
+            event: event
+                .map(Bound::unbind)
+                .unwrap_or_else(|| intern!(py, "message").clone().unbind()),
+            data: data
+                .map(Bound::unbind)
+                .unwrap_or_else(|| intern!(py, "").clone().unbind()),
+            id: id.map(Bound::unbind),
+            retry,
+        }
+    }
+
+    /// Event type; `"message"` when the stream did not name one.
+    #[getter]
+    fn event(&self, py: Python<'_>) -> Py<PyString> {
+        self.event.clone_ref(py)
+    }
+
+    /// Payload; multiple `data:` lines are joined with `\n`.
+    #[getter]
+    fn data(&self, py: Python<'_>) -> Py<PyString> {
+        self.data.clone_ref(py)
+    }
+
+    /// The last event ID seen on the stream (persists across events).
+    #[getter]
+    fn id(&self, py: Python<'_>) -> Option<Py<PyString>> {
+        self.id.as_ref().map(|id| id.clone_ref(py))
+    }
+
+    /// Reconnection time in milliseconds, if this event set one.
+    #[getter]
+    fn retry(&self) -> Option<u64> {
+        self.retry
+    }
+
+    /// Parse `data` as JSON.
+    fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        static LOADS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+        LOADS
+            .get_or_try_init(py, || {
+                py.import("json")?.getattr("loads").map(Bound::unbind)
+            })?
+            .bind(py)
+            .call1((self.data.bind(py),))
+    }
+
+    /// Serialise to the `text/event-stream` wire format.
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let mut out = String::new();
+        let event = self.event.bind(py).to_str()?;
+        if !event.is_empty() && event != "message" {
+            out.push_str("event: ");
+            out.push_str(event);
+            out.push('\n');
+        }
+        if let Some(id) = self.id_str(py)? {
+            out.push_str("id: ");
+            out.push_str(id);
+            out.push('\n');
+        }
+        if let Some(retry) = self.retry {
+            out.push_str(&format!("retry: {retry}\n"));
+        }
+        for line in self.data.bind(py).to_str()?.split('\n') {
+            out.push_str("data: ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push('\n');
+        Ok(PyBytes::new(py, out.as_bytes()))
+    }
+
+    fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let Ok(other) = other.cast::<PySseEvent>() else {
+            return Ok(false);
+        };
+        let other = other.get();
+        Ok(self.retry == other.retry
+            && self.event.bind(py).to_str()? == other.event.bind(py).to_str()?
+            && self.data.bind(py).to_str()? == other.data.bind(py).to_str()?
+            && self.id_str(py)? == other.id_str(py)?)
+    }
+
+    fn __hash__(&self, py: Python<'_>) -> PyResult<isize> {
+        let key = (
+            self.event.bind(py),
+            self.data.bind(py),
+            self.id.as_ref().map(|id| id.bind(py)),
+            self.retry,
+        );
+        key.into_pyobject(py)?.hash()
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let id = match &self.id {
+            Some(id) => id.bind(py).repr()?.to_string(),
+            None => "None".to_owned(),
+        };
+        let retry = match self.retry {
+            Some(ms) => ms.to_string(),
+            None => "None".to_owned(),
+        };
+        Ok(format!(
+            "SSEEvent(event={}, data={}, id={}, retry={})",
+            self.event.bind(py).repr()?,
+            self.data.bind(py).repr()?,
+            id,
+            retry
+        ))
+    }
+
+    /// Pickle / copy support.
+    fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
+        let py = slf.py();
+        let this = slf.get();
+        let args = PyTuple::new(
             py,
             [
-                ev.event.into_pyobject(py)?.into_any(),
-                ev.data.into_pyobject(py)?.into_any(),
-                ev.id.into_pyobject(py)?.into_any(),
-                ev.retry.into_pyobject(py)?.into_any(),
+                this.event.bind(py).clone().into_any(),
+                this.data.bind(py).clone().into_any(),
+                this.id
+                    .as_ref()
+                    .map(|id| id.bind(py).clone())
+                    .into_bound_py_any(py)?,
+                this.retry.into_bound_py_any(py)?,
             ],
         )?;
-        list.append(tuple)?;
+        PyTuple::new(py, [slf.get_type().into_any(), args.into_any()])
     }
-    Ok(list)
+
+    #[classattr]
+    fn __match_args__() -> (&'static str, &'static str, &'static str, &'static str) {
+        ("event", "data", "id", "retry")
+    }
+}
+
+/// Python strings that tend to repeat from one event to the next.
+#[derive(Default)]
+pub struct SinkCache {
+    name: Option<(String, Py<PyString>)>,
+    id: Option<(String, Py<PyString>)>,
+}
+
+fn cached(py: Python<'_>, slot: &mut Option<(String, Py<PyString>)>, value: &str) -> Py<PyString> {
+    match slot {
+        Some((text, object)) if text == value => object.clone_ref(py),
+        _ => {
+            let object = PyString::new(py, value).unbind();
+            *slot = Some((value.to_owned(), object.clone_ref(py)));
+            object
+        }
+    }
+}
+
+/// An [`EventSink`] that appends `SSEEvent` objects straight to a Python list.
+///
+/// Streams usually repeat one event name thousands of times, and the last
+/// event ID persists until the server changes it, so both are cached rather
+/// than re-allocated for every event.
+pub struct PyEventSink<'a, 'py> {
+    py: Python<'py>,
+    list: &'a Bound<'py, PyList>,
+    cache: &'a mut SinkCache,
+    error: Option<PyErr>,
+}
+
+impl EventSink for PyEventSink<'_, '_> {
+    fn dispatch(&mut self, event: &str, data: &str, id: Option<&str>, retry: Option<u64>) {
+        if self.error.is_some() {
+            return;
+        }
+        let py = self.py;
+        let item = PySseEvent {
+            event: cached(py, &mut self.cache.name, event),
+            data: PyString::new(py, data).unbind(),
+            id: id.map(|id| cached(py, &mut self.cache.id, id)),
+            retry,
+        };
+        if let Err(err) = Bound::new(py, item).and_then(|object| self.list.append(object)) {
+            self.error = Some(err);
+        }
+    }
+}
+
+/// A decoder plus its Python string cache, used wherever events go to Python.
+#[derive(Default)]
+pub struct PyDecoder {
+    decoder: SseDecoder,
+    cache: SinkCache,
+}
+
+impl PyDecoder {
+    /// Decode `chunks`, appending the completed events to `list`.
+    pub fn feed_into<'py, I>(
+        &mut self,
+        py: Python<'py>,
+        chunks: I,
+        list: &Bound<'py, PyList>,
+    ) -> PyResult<()>
+    where
+        I: IntoIterator,
+        I::Item: AsRef<[u8]>,
+    {
+        let mut sink = PyEventSink {
+            py,
+            list,
+            cache: &mut self.cache,
+            error: None,
+        };
+        for chunk in chunks {
+            self.decoder.feed(chunk.as_ref(), &mut sink);
+        }
+        match sink.error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    pub fn finish(&mut self) {
+        self.decoder.finish();
+    }
 }
 
 /// Incremental Server-Sent Events parser exposed to Python.
 ///
-/// `feed(data)` returns a list of `(event, data, id, retry)` tuples for every
-/// event completed by that chunk.
+/// `feed(data)` returns the list of `SSEEvent` objects completed by that chunk.
 #[pyclass(frozen, module = "nextreq._nextreq", name = "SSEParser")]
 pub struct SSEParser {
-    inner: Mutex<SseDecoder>,
+    inner: Mutex<PyDecoder>,
+}
+
+impl SSEParser {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PyDecoder> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 #[pymethods]
@@ -225,45 +483,32 @@ impl SSEParser {
     #[new]
     fn new() -> Self {
         SSEParser {
-            inner: Mutex::new(SseDecoder::new()),
+            inner: Mutex::new(PyDecoder::default()),
         }
     }
 
     /// Feed raw bytes; returns the events completed by this chunk.
     fn feed<'py>(&self, py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyList>> {
-        let mut out = Vec::new();
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .feed(data, &mut out);
-        events_to_py(py, out)
+        let list = PyList::empty(py);
+        self.lock().feed_into(py, [data], &list)?;
+        Ok(list)
     }
 
     /// Mark end of stream, discarding any unterminated event.
     fn finish(&self) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .finish();
+        self.lock().finish();
     }
 
     /// The last event ID seen so far, if any.
     #[getter]
     fn last_event_id(&self) -> Option<String> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .last_event_id()
-            .map(str::to_owned)
+        self.lock().decoder.last_event_id().map(str::to_owned)
     }
 
     /// The most recent `retry:` reconnection time in milliseconds, if any.
     #[getter]
     fn retry(&self) -> Option<u64> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .reconnection_time()
+        self.lock().decoder.reconnection_time()
     }
 }
 
@@ -272,7 +517,7 @@ mod tests {
     use super::*;
 
     fn parse(chunks: &[&[u8]]) -> Vec<SseEvent> {
-        let mut decoder = SseDecoder::new();
+        let mut decoder = SseDecoder::default();
         let mut out = Vec::new();
         for chunk in chunks {
             decoder.feed(chunk, &mut out);
@@ -415,7 +660,7 @@ mod tests {
 
     #[test]
     fn retry_must_be_all_digits() {
-        let mut decoder = SseDecoder::new();
+        let mut decoder = SseDecoder::default();
         let mut out = Vec::new();
         decoder.feed(b"retry: 10x\ndata: a\n\nretry: 250\ndata: b\n\n", &mut out);
         assert_eq!(
@@ -430,7 +675,7 @@ mod tests {
 
     #[test]
     fn retry_only_block_updates_reconnection_time_without_dispatch() {
-        let mut decoder = SseDecoder::new();
+        let mut decoder = SseDecoder::default();
         let mut out = Vec::new();
         decoder.feed(b"retry: 3000\n\ndata: a\n\n", &mut out);
         assert_eq!(out, vec![ev("message", "a", None, None)]);

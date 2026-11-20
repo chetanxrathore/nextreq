@@ -27,9 +27,12 @@ fn _nextreq(module: &Bound<'_, PyModule>) -> PyResult<()> {
     client::init_runtime();
     module.add_class::<client::HttpClient>()?;
     module.add_class::<client::ResponseStream>()?;
+    module.add_class::<client::LoopBridge>()?;
+    module.add_class::<client::TaskHandle>()?;
     module.add_class::<config::Timeout>()?;
     module.add_class::<config::RetryPolicy>()?;
     module.add_class::<sse::SSEParser>()?;
+    module.add_class::<sse::PySseEvent>()?;
     module.add_class::<ws::WebSocketConnection>()?;
     module.add_function(wrap_pyfunction!(config::parse_retry_after, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;

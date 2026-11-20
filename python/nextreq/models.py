@@ -25,7 +25,7 @@ from http import HTTPStatus
 from typing import IO, TYPE_CHECKING, Any, Final, TypeVar, Union, overload
 from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 
-from ._nextreq import ResponseStream, SSEParser, Timeout
+from ._nextreq import ResponseStream, SSEEvent, SSEParser, Timeout
 from .exceptions import (
     HTTPStatusError,
     InvalidURL,
@@ -900,42 +900,6 @@ class Request:
         return f"<Request [{self.method} {self.url}]>"
 
 
-# -- SSE ----------------------------------------------------------------------
-
-
-@dataclasses.dataclass(slots=True)
-class SSEEvent:
-    """One Server-Sent Event.
-
-    Attributes:
-        event: event type; ``"message"`` when the stream did not name one.
-        data: payload; multiple ``data:`` lines are joined with ``\\n``.
-        id: the last event ID seen on the stream (persists across events).
-        retry: reconnection time in milliseconds, if this event set one.
-    """
-
-    event: str = "message"
-    data: str = ""
-    id: str | None = None
-    retry: int | None = None
-
-    def json(self) -> Any:
-        """Parse ``data`` as JSON."""
-        return _json.loads(self.data)
-
-    def encode(self) -> bytes:
-        """Serialise to the ``text/event-stream`` wire format."""
-        lines: list[str] = []
-        if self.event and self.event != "message":
-            lines.append(f"event: {self.event}")
-        if self.id is not None:
-            lines.append(f"id: {self.id}")
-        if self.retry is not None:
-            lines.append(f"retry: {self.retry}")
-        lines.extend(f"data: {line}" for line in self.data.split("\n"))
-        return ("\n".join(lines) + "\n\n").encode("utf-8")
-
-
 # -- Response -----------------------------------------------------------------
 
 
@@ -1353,22 +1317,25 @@ class Response:
         yield from splitter.flush()
 
     def iter_sse(self) -> Iterator[SSEEvent]:
-        """Iterate over Server-Sent Events, parsed by the Rust core."""
+        """Iterate over Server-Sent Events.
+
+        Parsing (WHATWG event-stream rules) and ``SSEEvent`` construction both
+        happen in the Rust core, in batches, with the GIL released while
+        waiting for data.
+        """
         if self._content is None and self._handle is not None:
             self._begin_stream()
             try:
                 read_events = self._handle.read_events
                 while (batch := read_events()) is not None:
-                    for event, data, event_id, retry in batch:
-                        yield SSEEvent(event, data, event_id, retry)
+                    yield from batch
                 self._exhausted = True
             finally:
                 self.close()
             return
         parser = SSEParser()
         for chunk in self.iter_bytes():
-            for event, data, event_id, retry in parser.feed(chunk):
-                yield SSEEvent(event, data, event_id, retry)
+            yield from parser.feed(chunk)
 
     def close(self) -> None:
         """Release the connection. Safe to call repeatedly."""
@@ -1466,16 +1433,16 @@ class Response:
             try:
                 aread_events = self._handle.aread_events
                 while (batch := await aread_events()) is not None:
-                    for event, data, event_id, retry in batch:
-                        yield SSEEvent(event, data, event_id, retry)
+                    for event in batch:
+                        yield event
                 self._exhausted = True
             finally:
                 await self.aclose()
             return
         parser = SSEParser()
         async for chunk in self.aiter_bytes():
-            for event, data, event_id, retry in parser.feed(chunk):
-                yield SSEEvent(event, data, event_id, retry)
+            for event in parser.feed(chunk):
+                yield event
 
     async def aclose(self) -> None:
         """Release the connection. Safe to call repeatedly."""

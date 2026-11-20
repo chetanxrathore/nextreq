@@ -24,8 +24,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Version};
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 use pyo3::types::{PyBytes, PyList, PyString, PyTuple};
@@ -34,7 +35,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{build_tls_config, Timeout, Timeouts, TlsOptions};
 use crate::errors::{classify, ConnectTimedOut, ErrorKind, NxError, NxResult, Phase};
-use crate::sse::{events_to_py, SseDecoder, SseEvent};
+use crate::sse::PyDecoder;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -60,7 +61,10 @@ pub fn init_runtime() {
             let cores = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
-            cores.clamp(2, 8)
+            // Requests are I/O-bound and their results are consumed by one
+            // Python thread, so a few workers are plenty; more only adds
+            // work-stealing churn (measured: 4 is the sweet spot).
+            cores.clamp(2, 4)
         });
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
@@ -114,6 +118,188 @@ where
             Ok(value) => value.into_bound_py_any(py),
             Err(err) => Err(err.into_pyerr(py)),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// asyncio completion bridge
+// ---------------------------------------------------------------------------
+//
+// `pyo3-async-runtimes` is used for the shared runtime and for low-frequency
+// awaitables (WebSockets, stream reads). The request hot path uses this
+// purpose-built bridge instead, because under high concurrency the generic
+// bridge pays, per request, two task spawns, a blocking-pool hop and a GIL
+// acquisition from a foreign thread (which fights the event loop for the GIL).
+//
+// Here a finished request is pushed onto a queue *without touching the
+// interpreter*. The first completion after the queue was last drained
+// schedules a single `loop.call_soon_threadsafe(bridge.drain)` (from the
+// blocking pool, so I/O workers never wait for the GIL); `drain` then runs on
+// the event-loop thread, converts every queued result to Python objects and
+// resolves the futures. Completions are therefore batched, and result
+// conversion happens on the thread that already holds the GIL.
+
+/// Turns a finished Rust result into the Python object for its future.
+type Converter = Box<dyn FnOnce(Python<'_>) -> PyResult<Py<PyAny>> + Send>;
+
+struct Completion {
+    /// The `asyncio.Future` awaiting this result.
+    future: Py<PyAny>,
+    /// Keeps the bridge reachable from the wake-up thread.
+    bridge: Py<LoopBridge>,
+    result: Converter,
+}
+
+#[derive(Default)]
+struct BridgeQueue {
+    pending: Mutex<Vec<Completion>>,
+    /// True while a `drain` call is scheduled on the event loop.
+    wake_scheduled: AtomicBool,
+}
+
+impl BridgeQueue {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Completion>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queue a completion; called from Tokio workers, never attached.
+    fn complete(self: &Arc<Self>, completion: Completion) {
+        self.lock().push(completion);
+        if !self.wake_scheduled.swap(true, Ordering::AcqRel) {
+            let queue = Arc::clone(self);
+            runtime().spawn_blocking(move || wake_event_loop(&queue));
+        }
+    }
+}
+
+/// Ask the event loop to run `LoopBridge.drain`. Runs on the blocking pool.
+fn wake_event_loop(queue: &BridgeQueue) {
+    Python::attach(|py| loop {
+        let bridge = queue.lock().last().map(|c| c.bridge.clone_ref(py));
+        let Some(bridge) = bridge else {
+            // An earlier drain already took everything. Release the flag, then
+            // re-check so a completion that raced with us is not stranded.
+            queue.wake_scheduled.store(false, Ordering::Release);
+            if queue.lock().is_empty() || queue.wake_scheduled.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            continue;
+        };
+        let bridge = bridge.bind(py);
+        let scheduled = bridge
+            .getattr(intern!(py, "drain"))
+            .and_then(|drain| bridge.get().call_soon_threadsafe.bind(py).call1((drain,)));
+        if scheduled.is_err() {
+            // The event loop is closed, so nobody can await these results.
+            let orphaned = std::mem::take(&mut *queue.lock());
+            queue.wake_scheduled.store(false, Ordering::Release);
+            drop(orphaned);
+        }
+        return;
+    });
+}
+
+/// Batches results from the Tokio runtime onto one asyncio event loop.
+///
+/// Create one per event loop with `LoopBridge(loop.call_soon_threadsafe)`.
+#[pyclass(frozen, module = "nextreq._nextreq", name = "LoopBridge")]
+pub struct LoopBridge {
+    queue: Arc<BridgeQueue>,
+    call_soon_threadsafe: Py<PyAny>,
+}
+
+impl LoopBridge {
+    /// Run `work` on the runtime and resolve `future` with its result.
+    fn spawn<F, T>(slf: &Bound<'_, Self>, future: &Bound<'_, PyAny>, work: F) -> TaskHandle
+    where
+        F: Future<Output = NxResult<T>> + Send + 'static,
+        T: for<'py> IntoPyObject<'py> + Send + 'static,
+    {
+        let queue = Arc::clone(&slf.get().queue);
+        let bridge = slf.clone().unbind();
+        let future = future.clone().unbind();
+        let task = runtime().spawn(async move {
+            let result = work.await;
+            queue.complete(Completion {
+                future,
+                bridge,
+                result: Box::new(move |py| Outcome(result).into_pyobject(py).map(Bound::unbind)),
+            });
+        });
+        TaskHandle {
+            abort: task.abort_handle(),
+        }
+    }
+}
+
+#[pymethods]
+impl LoopBridge {
+    #[new]
+    fn py_new(call_soon_threadsafe: Py<PyAny>) -> Self {
+        LoopBridge {
+            queue: Arc::new(BridgeQueue::default()),
+            call_soon_threadsafe,
+        }
+    }
+
+    /// Resolve every queued future. Runs on the event-loop thread.
+    fn drain(&self, py: Python<'_>) {
+        loop {
+            // Clear the flag *before* taking the batch: a completion pushed
+            // after this point schedules its own wake-up, so none is lost.
+            self.queue.wake_scheduled.store(false, Ordering::Release);
+            let batch = std::mem::take(&mut *self.queue.lock());
+            if batch.is_empty() {
+                return;
+            }
+            for completion in batch {
+                let future = completion.future.bind(py);
+                // A cancelled future must be left alone; dropping the result
+                // releases its connection.
+                let done = future
+                    .call_method0(intern!(py, "done"))
+                    .and_then(|done| done.is_truthy())
+                    .unwrap_or(true);
+                if done {
+                    continue;
+                }
+                let delivered = match (completion.result)(py) {
+                    Ok(value) => future.call_method1(intern!(py, "set_result"), (value,)),
+                    Err(err) => {
+                        future.call_method1(intern!(py, "set_exception"), (err.into_value(py),))
+                    }
+                };
+                if let Err(err) = delivered {
+                    err.write_unraisable(py, Some(future));
+                }
+            }
+        }
+    }
+
+    /// Number of results waiting to be delivered (for diagnostics).
+    #[getter]
+    fn pending(&self) -> usize {
+        self.queue.lock().len()
+    }
+}
+
+/// Handle to an in-flight asynchronous request.
+#[pyclass(frozen, module = "nextreq._nextreq", name = "TaskHandle")]
+pub struct TaskHandle {
+    abort: tokio::task::AbortHandle,
+}
+
+#[pymethods]
+impl TaskHandle {
+    /// Abort the request (no-op if it already finished). The connection is
+    /// dropped and the future is never resolved.
+    fn abort(&self) {
+        self.abort.abort();
+    }
+
+    #[getter]
+    fn is_finished(&self) -> bool {
+        self.abort.is_finished()
     }
 }
 
@@ -318,7 +504,7 @@ pub struct Timings {
 }
 
 pub enum RawBody {
-    Full(Bytes),
+    Full(Vec<Bytes>),
     Stream(Box<StreamState>),
 }
 
@@ -367,7 +553,7 @@ impl<'py> IntoPyObject<'py> for RawResponse {
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let headers = headers_to_py(py, &self.headers)?;
         let body = match self.body {
-            RawBody::Full(bytes) => PyBytes::new(py, &bytes).into_any(),
+            RawBody::Full(chunks) => join_chunks(py, &chunks)?.into_any(),
             RawBody::Stream(state) => Bound::new(py, ResponseStream::new(*state))?.into_any(),
         };
         let t = self.timings;
@@ -508,31 +694,22 @@ async fn next_chunk(
     result.map_err(|e| classify(e, Phase::Body))
 }
 
+/// Read the whole body as the list of chunks it arrived in.
+///
+/// The chunks are deliberately *not* concatenated here: they are copied once,
+/// straight into the final Python `bytes` object (see [`join_chunks`]), which
+/// halves the memory traffic for large bodies.
 async fn read_body(
     response: &mut reqwest::Response,
     read_timeout: Option<Duration>,
-) -> NxResult<Bytes> {
-    let hint = response.content_length().unwrap_or(0) as usize;
-    let mut first: Option<Bytes> = None;
-    let mut buffer: Option<BytesMut> = None;
+) -> NxResult<Vec<Bytes>> {
+    let mut chunks = Vec::new();
     while let Some(chunk) = next_chunk(response, read_timeout).await? {
-        match (&mut buffer, first.take()) {
-            (Some(buf), _) => buf.extend_from_slice(&chunk),
-            (None, None) => first = Some(chunk),
-            (None, Some(head)) => {
-                let capacity = hint.clamp(head.len() + chunk.len(), 64 * 1024 * 1024);
-                let mut buf = BytesMut::with_capacity(capacity);
-                buf.extend_from_slice(&head);
-                buf.extend_from_slice(&chunk);
-                buffer = Some(buf);
-            }
+        if !chunk.is_empty() {
+            chunks.push(chunk);
         }
     }
-    Ok(match (buffer, first) {
-        (Some(buf), _) => buf.freeze(),
-        (None, Some(only)) => only,
-        (None, None) => Bytes::new(),
-    })
+    Ok(chunks)
 }
 
 /// Run one request. Pure Rust: safe to call from any Tokio worker.
@@ -629,56 +806,149 @@ async fn stream_next(state: &SharedStream) -> NxResult<Option<Bytes>> {
     }
 }
 
-async fn stream_read_all(state: &SharedStream) -> NxResult<Bytes> {
+async fn stream_read_all(state: &SharedStream) -> NxResult<Vec<Bytes>> {
     let mut guard = state.lock().await;
     let Some(mut active) = guard.take() else {
-        return Ok(Bytes::new());
+        return Ok(Vec::new());
     };
     read_body(&mut active.response, active.read_timeout).await
 }
 
-async fn stream_next_events(
-    state: &SharedStream,
-    decoder: &Mutex<SseDecoder>,
-) -> NxResult<Option<Vec<SseEvent>>> {
-    loop {
-        match stream_next(state).await? {
-            None => {
-                decoder.lock().unwrap_or_else(|e| e.into_inner()).finish();
-                return Ok(None);
-            }
-            Some(chunk) => {
-                let mut events = Vec::new();
-                decoder
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .feed(&chunk, &mut events);
-                if !events.is_empty() {
-                    return Ok(Some(events));
+/// How many chunks the pump may read ahead of the consumer.
+const PUMP_QUEUE_CHUNKS: usize = 16;
+/// Upper bound on the bytes handed to Python by one streaming read.
+const MAX_BYTES_PER_READ: usize = 1024 * 1024;
+
+/// Background task that reads a streamed response body ahead of Python.
+///
+/// Fetching one chunk is a round trip to the connection task. Doing that from
+/// the Python thread costs a thread park/unpark per chunk; doing it from a
+/// Tokio task lets the body arrive while Python is busy, so each streaming
+/// read hands over everything received so far in a single crossing. That
+/// matters most for many-small-chunk streams such as Server-Sent Events. The
+/// bounded queue applies backpressure when Python is slower than the network.
+struct StreamPump {
+    queue: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<NxResult<Bytes>>>,
+    /// An error that arrived after chunks were already collected for the caller.
+    deferred_error: Mutex<Option<NxError>>,
+    task: tokio::task::AbortHandle,
+}
+
+impl StreamPump {
+    fn start(state: SharedStream) -> Arc<StreamPump> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(PUMP_QUEUE_CHUNKS);
+        let task = runtime().spawn(async move {
+            loop {
+                match stream_next(&state).await {
+                    Ok(Some(chunk)) => {
+                        if sender.send(Ok(chunk)).await.is_err() {
+                            break; // the consumer went away
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        let _ = sender.send(Err(err)).await;
+                        break;
+                    }
                 }
             }
+        });
+        Arc::new(StreamPump {
+            queue: tokio::sync::Mutex::new(receiver),
+            deferred_error: Mutex::new(None),
+            task: task.abort_handle(),
+        })
+    }
+
+    fn take_deferred_error(&self) -> Option<NxError> {
+        self.deferred_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    /// Wait for at least one chunk, then also take whatever else has already
+    /// arrived (up to `max_bytes`). `None` means end of stream.
+    async fn next_chunks(&self, max_bytes: usize) -> NxResult<Option<Vec<Bytes>>> {
+        if let Some(err) = self.take_deferred_error() {
+            return Err(err);
         }
+        let mut queue = self.queue.lock().await;
+        let Some(first) = queue.recv().await else {
+            return Ok(None);
+        };
+        let first = first?;
+        let mut total = first.len();
+        let mut chunks = vec![first];
+        while total < max_bytes {
+            match queue.try_recv() {
+                Ok(Ok(chunk)) => {
+                    total += chunk.len();
+                    chunks.push(chunk);
+                }
+                Ok(Err(err)) => {
+                    // Deliver what we have; raise on the next call.
+                    *self
+                        .deferred_error
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(err);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        Ok(Some(chunks))
+    }
+
+    /// Everything that is left, as the chunks it arrived in.
+    async fn read_to_end(&self) -> NxResult<Vec<Bytes>> {
+        let mut all = Vec::new();
+        while let Some(chunks) = self.next_chunks(usize::MAX).await? {
+            all.extend(chunks);
+        }
+        Ok(all)
     }
 }
 
-/// `bytes | None` result of a streaming read.
-pub struct ChunkOut(Option<Bytes>);
+fn join_chunks<'py>(py: Python<'py>, chunks: &[Bytes]) -> PyResult<Bound<'py, PyBytes>> {
+    match chunks {
+        [] => return Ok(PyBytes::new(py, b"")),
+        [only] => return Ok(PyBytes::new(py, only)),
+        _ => {}
+    }
+    let total: usize = chunks.iter().map(Bytes::len).sum();
+    PyBytes::new_with(py, total, |buffer| {
+        let mut offset = 0;
+        for chunk in chunks {
+            buffer[offset..offset + chunk.len()].copy_from_slice(chunk);
+            offset += chunk.len();
+        }
+        Ok(())
+    })
+}
 
-impl<'py> IntoPyObject<'py> for ChunkOut {
+/// `bytes | None` result of a streaming read.
+pub struct ChunksOut(Option<Vec<Bytes>>);
+
+impl<'py> IntoPyObject<'py> for ChunksOut {
     type Target = PyAny;
     type Output = Bound<'py, PyAny>;
     type Error = PyErr;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         Ok(match self.0 {
-            Some(bytes) => PyBytes::new(py, &bytes).into_any(),
+            Some(chunks) => join_chunks(py, &chunks)?.into_any(),
             None => py.None().into_bound(py),
         })
     }
 }
 
-/// `list[tuple] | None` result of a streaming SSE read.
-pub struct EventsOut(Option<Vec<SseEvent>>);
+/// `list[SSEEvent] | None` result of a streaming SSE read. Decoding happens
+/// here, while attached, so events are built directly as Python objects.
+pub struct EventsOut {
+    chunks: Option<Vec<Bytes>>,
+    decoder: Arc<Mutex<PyDecoder>>,
+}
 
 impl<'py> IntoPyObject<'py> for EventsOut {
     type Target = PyAny;
@@ -686,10 +956,18 @@ impl<'py> IntoPyObject<'py> for EventsOut {
     type Error = PyErr;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        Ok(match self.0 {
-            Some(events) => events_to_py(py, events)?.into_any(),
-            None => py.None().into_bound(py),
-        })
+        let mut decoder = self.decoder.lock().unwrap_or_else(|e| e.into_inner());
+        match self.chunks {
+            Some(chunks) => {
+                let list = PyList::empty(py);
+                decoder.feed_into(py, &chunks, &list)?;
+                Ok(list.into_any())
+            }
+            None => {
+                decoder.finish();
+                Ok(py.None().into_bound(py))
+            }
+        }
     }
 }
 
@@ -700,74 +978,117 @@ impl<'py> IntoPyObject<'py> for EventsOut {
 #[pyclass(frozen, module = "nextreq._nextreq", name = "ResponseStream")]
 pub struct ResponseStream {
     state: SharedStream,
-    decoder: Arc<Mutex<SseDecoder>>,
+    /// Started lazily by the first incremental read.
+    pump: Mutex<Option<Arc<StreamPump>>>,
+    decoder: Arc<Mutex<PyDecoder>>,
 }
 
 impl ResponseStream {
     fn new(state: StreamState) -> Self {
         ResponseStream {
             state: Arc::new(tokio::sync::Mutex::new(Some(state))),
-            decoder: Arc::new(Mutex::new(SseDecoder::new())),
+            pump: Mutex::new(None),
+            decoder: Arc::new(Mutex::new(PyDecoder::default())),
         }
+    }
+
+    fn existing_pump(&self) -> Option<Arc<StreamPump>> {
+        self.pump.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn pump(&self) -> Arc<StreamPump> {
+        self.pump
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| StreamPump::start(self.state.clone()))
+            .clone()
     }
 }
 
 #[pymethods]
 impl ResponseStream {
-    /// Next body chunk, or `None` at end of stream.
+    /// The next piece of the body, or `None` at end of stream.
+    ///
+    /// Returns everything received so far (at least one chunk), so the size
+    /// of the returned `bytes` varies.
     fn read<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let result = block_on_interruptible(py, stream_next(&self.state))?;
-        Outcome(result.map(ChunkOut)).into_pyobject(py)
+        let pump = self.pump();
+        let result = block_on_interruptible(py, pump.next_chunks(MAX_BYTES_PER_READ))?;
+        Outcome(result.map(ChunksOut)).into_pyobject(py)
     }
 
     /// Awaitable form of `read()`.
     fn aread<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
+        let pump = self.pump();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(Outcome(stream_next(&state).await.map(ChunkOut)))
+            Ok(Outcome(
+                pump.next_chunks(MAX_BYTES_PER_READ).await.map(ChunksOut),
+            ))
         })
     }
 
     /// The rest of the body as one `bytes` object.
     fn read_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let result = block_on_interruptible(py, stream_read_all(&self.state))?;
-        Outcome(result.map(|b| ChunkOut(Some(b)))).into_pyobject(py)
+        let result = match self.existing_pump() {
+            Some(pump) => block_on_interruptible(py, pump.read_to_end())?,
+            None => block_on_interruptible(py, stream_read_all(&self.state))?,
+        };
+        Outcome(result.map(|chunks| ChunksOut(Some(chunks)))).into_pyobject(py)
     }
 
     /// Awaitable form of `read_all()`.
     fn aread_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pump = self.existing_pump();
         let state = self.state.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(Outcome(
-                stream_read_all(&state).await.map(|b| ChunkOut(Some(b))),
-            ))
+            let result = match pump {
+                Some(pump) => pump.read_to_end().await,
+                None => stream_read_all(&state).await,
+            };
+            Ok(Outcome(result.map(|chunks| ChunksOut(Some(chunks)))))
         })
     }
 
-    /// Next batch of Server-Sent Events as `(event, data, id, retry)` tuples,
-    /// or `None` at end of stream. Parsing happens in Rust with the GIL released.
+    /// Next batch of Server-Sent Events as a `list[SSEEvent]`, or `None` at
+    /// end of stream.
+    ///
+    /// The body is read ahead on the Tokio runtime with the GIL released;
+    /// each call decodes everything received so far. The list may be empty
+    /// when the data received did not complete an event.
     fn read_events<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let result = block_on_interruptible(py, stream_next_events(&self.state, &self.decoder))?;
-        Outcome(result.map(EventsOut)).into_pyobject(py)
+        let pump = self.pump();
+        let result = block_on_interruptible(py, pump.next_chunks(MAX_BYTES_PER_READ))?;
+        Outcome(result.map(|chunks| EventsOut {
+            chunks,
+            decoder: self.decoder.clone(),
+        }))
+        .into_pyobject(py)
     }
 
     /// Awaitable form of `read_events()`.
     fn aread_events<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
+        let pump = self.pump();
         let decoder = self.decoder.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             Ok(Outcome(
-                stream_next_events(&state, &decoder).await.map(EventsOut),
+                pump.next_chunks(MAX_BYTES_PER_READ)
+                    .await
+                    .map(|chunks| EventsOut { chunks, decoder }),
             ))
         })
     }
 
     /// Release the connection. Safe to call more than once.
     fn close(&self) {
+        // Stop the pump first: it may be parked waiting for the next chunk
+        // while holding the stream lock.
+        if let Some(pump) = self.existing_pump() {
+            pump.task.abort();
+        }
         match self.state.try_lock() {
             Ok(mut guard) => *guard = None,
             Err(_) => {
-                // A read is in flight on another thread; close once it yields.
+                // A read is in flight; close as soon as it lets go.
                 let state = self.state.clone();
                 runtime().spawn(async move {
                     *state.lock().await = None;
@@ -1085,26 +1406,32 @@ impl HttpClient {
         Outcome(result).into_pyobject(py)
     }
 
-    /// Awaitable form of `send()`; the request runs on the Tokio runtime.
-    #[pyo3(signature = (method, url, headers, body = None, timeout = None, stream = false))]
+    /// Asynchronous form of `send()`.
+    ///
+    /// The request runs on the Tokio runtime and `future` (an
+    /// `asyncio.Future` created on the bridge's event loop) is resolved with
+    /// the same tuple `send()` returns, or with the exception. Returns a
+    /// handle that can abort the request, e.g. when the awaiting task is
+    /// cancelled.
+    #[pyo3(signature = (bridge, future, method, url, headers, body = None, timeout = None, stream = false))]
     #[allow(clippy::too_many_arguments)]
     fn send_async<'py>(
         &self,
         py: Python<'py>,
+        bridge: &Bound<'py, LoopBridge>,
+        future: &Bound<'py, PyAny>,
         method: &str,
         url: &str,
         headers: &Bound<'py, PyAny>,
         body: Option<PyBackedBytes>,
         timeout: Option<&Bound<'py, Timeout>>,
         stream: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<TaskHandle> {
         let prepared = match self.prepare(method, url, headers, body, timeout)? {
             Ok(prepared) => prepared,
             Err(err) => return Err(err.into_pyerr(py)),
         };
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(Outcome(execute(prepared, stream).await))
-        })
+        Ok(LoopBridge::spawn(bridge, future, execute(prepared, stream)))
     }
 
     /// Open a WebSocket connection (awaitable).

@@ -1,7 +1,8 @@
 """Type stubs for the compiled Rust extension ``nextreq._nextreq``."""
 
-from collections.abc import Awaitable, Iterable
-from typing import Final, final
+from asyncio import Future
+from collections.abc import Awaitable, Callable, Iterable
+from typing import Any, Final, final
 
 __version__: Final[str]
 HTTP3_ENABLED: Final[bool]
@@ -10,8 +11,6 @@ DEFAULT_READ_TIMEOUT: Final[float]
 DEFAULT_WRITE_TIMEOUT: Final[float]
 DEFAULT_POOL_TIMEOUT: Final[float]
 
-# (event, data, id, retry)
-SSETuple = tuple[str, str, str | None, int | None]
 # (total, pool, connect, ttfb, download) in seconds
 RawTimings = tuple[float, float, float | None, float, float | None]
 # (status, http_version, headers, body, timings)
@@ -87,11 +86,49 @@ def parse_retry_after(value: str) -> float | None:
     """Parse a ``Retry-After`` header (delta-seconds or HTTP-date) into seconds."""
 
 @final
+class SSEEvent:
+    """One Server-Sent Event (immutable).
+
+    Attributes:
+        event: event type; ``"message"`` when the stream did not name one.
+        data: payload; multiple ``data:`` lines are joined with ``\\n``.
+        id: the last event ID seen on the stream (persists across events).
+        retry: reconnection time in milliseconds, if this event set one.
+    """
+
+    __match_args__: Final = ("event", "data", "id", "retry")
+
+    def __init__(
+        self,
+        event: str | None = None,
+        data: str | None = None,
+        id: str | None = None,
+        retry: int | None = None,
+    ) -> None: ...
+    @property
+    def event(self) -> str: ...
+    @property
+    def data(self) -> str: ...
+    @property
+    def id(self) -> str | None: ...
+    @property
+    def retry(self) -> int | None: ...
+    def json(self) -> Any:
+        """Parse ``data`` as JSON."""
+
+    def encode(self) -> bytes:
+        """Serialise to the ``text/event-stream`` wire format."""
+
+    def __eq__(self, other: object) -> bool: ...
+    def __hash__(self) -> int: ...
+    def __repr__(self) -> str: ...
+
+@final
 class SSEParser:
     """Incremental WHATWG Server-Sent Events parser."""
 
     def __init__(self) -> None: ...
-    def feed(self, data: bytes) -> list[SSETuple]: ...
+    def feed(self, data: bytes) -> list[SSEEvent]: ...
     def finish(self) -> None: ...
     @property
     def last_event_id(self) -> str | None: ...
@@ -106,11 +143,28 @@ class ResponseStream:
     def aread(self) -> Awaitable[bytes | None]: ...
     def read_all(self) -> bytes: ...
     def aread_all(self) -> Awaitable[bytes]: ...
-    def read_events(self) -> list[SSETuple] | None: ...
-    def aread_events(self) -> Awaitable[list[SSETuple] | None]: ...
+    def read_events(self) -> list[SSEEvent] | None: ...
+    def aread_events(self) -> Awaitable[list[SSEEvent] | None]: ...
     def close(self) -> None: ...
     @property
     def is_closed(self) -> bool: ...
+
+@final
+class LoopBridge:
+    """Batches results from the Tokio runtime onto one asyncio event loop."""
+
+    def __init__(self, call_soon_threadsafe: Callable[..., Any]) -> None: ...
+    def drain(self) -> None: ...
+    @property
+    def pending(self) -> int: ...
+
+@final
+class TaskHandle:
+    """Handle to an in-flight asynchronous request."""
+
+    def abort(self) -> None: ...
+    @property
+    def is_finished(self) -> bool: ...
 
 @final
 class WebSocketConnection:
@@ -157,13 +211,16 @@ class HttpClient:
     ) -> RawResponse: ...
     def send_async(
         self,
+        bridge: LoopBridge,
+        future: Future[RawResponse],
         method: str,
         url: str,
         headers: Iterable[tuple[str, str]],
         body: bytes | None = None,
         timeout: Timeout | None = None,
         stream: bool = False,
-    ) -> Awaitable[RawResponse]: ...
+    ) -> TaskHandle:
+        """Run the request on the Tokio runtime and resolve ``future`` with the result."""
     def ws_connect(
         self,
         url: str,

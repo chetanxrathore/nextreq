@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import pickle
 import time
 
 import pytest
@@ -26,7 +28,7 @@ MIXED_EVENTS = [
 
 def test_parser_basic_event() -> None:
     parser = SSEParser()
-    assert parser.feed(b"data: hello\n\n") == [("message", "hello", None, None)]
+    assert parser.feed(b"data: hello\n\n") == [SSEEvent("message", "hello", None, None)]
     assert parser.last_event_id is None and parser.retry is None
 
 
@@ -34,7 +36,8 @@ def test_parser_whatwg_rules() -> None:
     parser = SSEParser()
     events = parser.feed(SSE_FIXTURES["mixed"])
     parser.finish()
-    assert [SSEEvent(*e) for e in events] == MIXED_EVENTS
+    assert events == MIXED_EVENTS
+    assert all(isinstance(e, SSEEvent) for e in events)
     assert parser.last_event_id == "42" and parser.retry == 1500
 
 
@@ -42,34 +45,31 @@ def test_parser_whatwg_rules() -> None:
 def test_parser_is_independent_of_chunk_boundaries(chunk_size: int) -> None:
     payload = SSE_FIXTURES["mixed"]
     parser = SSEParser()
-    events: list[tuple[str, str, str | None, int | None]] = []
+    events: list[SSEEvent] = []
     for start in range(0, len(payload), chunk_size):
         events.extend(parser.feed(payload[start : start + chunk_size]))
-    assert [SSEEvent(*e) for e in events] == MIXED_EVENTS
+    assert events == MIXED_EVENTS
 
 
 def test_parser_line_endings_and_bom() -> None:
     for newline in (b"\n", b"\r\n", b"\r"):
         parser = SSEParser()
         stream = b"\xef\xbb\xbf" + newline.join([b"data: a", b"data: b", b"", b"data: c", b"", b""])
-        assert parser.feed(stream) == [
-            ("message", "a\nb", None, None),
-            ("message", "c", None, None),
-        ]
+        assert parser.feed(stream) == [SSEEvent(data="a\nb"), SSEEvent(data="c")]
 
 
 def test_parser_field_edge_cases() -> None:
     parser = SSEParser()
     assert parser.feed(b"data:no-space\n\ndata:  two-spaces\n\ndata\n\n") == [
-        ("message", "no-space", None, None),
-        ("message", " two-spaces", None, None),
-        ("message", "", None, None),
+        SSEEvent(data="no-space"),
+        SSEEvent(data=" two-spaces"),
+        SSEEvent(data=""),
     ]
     # retry must be digits only; ids containing NUL are ignored; an empty id resets.
     assert parser.feed(b"retry: 5s\nid: a\x00b\ndata: x\n\nid: 7\ndata: y\n\nid\ndata: z\n\n") == [
-        ("message", "x", None, None),
-        ("message", "y", "7", None),
-        ("message", "z", None, None),
+        SSEEvent(data="x"),
+        SSEEvent(data="y", id="7"),
+        SSEEvent(data="z"),
     ]
     assert parser.retry is None
 
@@ -83,10 +83,22 @@ def test_sse_event_model() -> None:
     assert multi.encode() == b"data: a\ndata: b\n\n"
     # encode() output parses back to the same event.
     parser = SSEParser()
-    assert [SSEEvent(*e) for e in parser.feed(event.encode() + multi.encode())] == [
-        event,
-        SSEEvent(data="a\nb", id="9"),
-    ]
+    assert parser.feed(event.encode() + multi.encode()) == [event, SSEEvent(data="a\nb", id="9")]
+
+    # Events are immutable value objects.
+    assert repr(event) == """SSEEvent(event='update', data='{"a": 1}', id='9', retry=250)"""
+    assert hash(event) == hash(SSEEvent("update", '{"a": 1}', "9", 250))
+    assert event != SSEEvent("update", '{"a": 1}', "9", 251) and event != "update"
+    assert len({event, SSEEvent("update", '{"a": 1}', "9", 250)}) == 1
+    with pytest.raises(AttributeError):
+        event.data = "changed"  # type: ignore[misc]
+    assert pickle.loads(pickle.dumps(event)) == event
+    assert copy.deepcopy(multi) == multi
+    match event:
+        case SSEEvent("update", data, "9", retry):
+            assert data == '{"a": 1}' and retry == 250
+        case _:
+            raise AssertionError("structural pattern matching should work")
 
 
 # -- response.iter_sse() ------------------------------------------------------

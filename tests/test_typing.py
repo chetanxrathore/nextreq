@@ -169,7 +169,9 @@ def test_config_types() -> None:
     assert_type(policy.retry_statuses, frozenset[int])
     assert_type(policy.delay(1, "3"), float)
     assert_type(nextreq.parse_retry_after("3"), float | None)
-    assert_type(SSEParser().feed(b"data: x\n\n"), list[tuple[str, str, str | None, int | None]])
+    assert_type(SSEParser().feed(b"data: x\n\n"), list[SSEEvent])
+    assert_type(SSEEvent(data="x").data, str)
+    assert_type(SSEEvent(data="x").retry, int | None)
     assert_type(nextreq.__version__, str)
     assert_type(nextreq.HTTP3_ENABLED, bool)
 

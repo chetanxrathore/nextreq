@@ -19,7 +19,7 @@ from collections.abc import AsyncIterator, Callable, Generator, Iterable, Iterat
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypedDict, TypeVar, Union, overload
 
 from . import _nextreq
-from ._nextreq import HttpClient, RetryPolicy, Timeout, WebSocketConnection
+from ._nextreq import HttpClient, LoopBridge, RetryPolicy, Timeout, WebSocketConnection
 from .exceptions import (
     ClientClosed,
     DecodingError,
@@ -201,6 +201,9 @@ def _as_hook_list(hooks: Any) -> list[Any]:
     if callable(hooks):
         return [hooks]
     return list(hooks)
+
+
+_get_running_loop = asyncio.get_running_loop
 
 
 def _sleep(seconds: float) -> None:
@@ -1078,6 +1081,8 @@ class AsyncClient(_BaseClient):
             on_error=on_error,
         )
         self._transport: AsyncTransport | None = transport
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._bridge: LoopBridge | None = None
         if transport is None:
             if _engine is not None:
                 self._raw = _engine
@@ -1100,6 +1105,11 @@ class AsyncClient(_BaseClient):
 
     # -- sending ----------------------------------------------------------
 
+    def _bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Attach to the running event loop (a client may outlive one loop)."""
+        self._loop = loop
+        self._bridge = LoopBridge(loop.call_soon_threadsafe)
+
     async def _exchange(self, request: Request, stream: bool) -> Response:
         """One request/response exchange, with cookies and hooks applied."""
         if self._cookies._jar or request._cookie_base is not None:
@@ -1112,17 +1122,27 @@ class AsyncClient(_BaseClient):
         try:
             raw = self._raw
             if raw is not None:
-                response = Response._from_raw(
-                    await raw.send_async(
-                        request.method,
-                        request.url._url,
-                        request.headers._list,
-                        request.content or None,
-                        request.timeout,  # type: ignore[arg-type]
-                        stream,
-                    ),
-                    request,
+                loop = _get_running_loop()
+                if loop is not self._loop:
+                    self._bind_loop(loop)
+                future = loop.create_future()
+                task = raw.send_async(
+                    self._bridge,  # type: ignore[arg-type]
+                    future,
+                    request.method,
+                    request.url._url,
+                    request.headers._list,
+                    request.content or None,
+                    request.timeout,  # type: ignore[arg-type]
+                    stream,
                 )
+                try:
+                    response = Response._from_raw(await future, request)
+                except BaseException:
+                    # Cancelled (or failed): stop the in-flight request so its
+                    # connection slot is released immediately.
+                    task.abort()
+                    raise
             else:
                 assert self._transport is not None
                 started = time.perf_counter()
