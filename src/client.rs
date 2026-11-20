@@ -174,7 +174,9 @@ impl BridgeQueue {
 
 /// Ask the event loop to run `LoopBridge.drain`. Runs on the blocking pool.
 fn wake_event_loop(queue: &BridgeQueue) {
-    Python::attach(|py| loop {
+    // `try_attach` declines (instead of blocking forever) when the interpreter
+    // is shutting down; nobody is left to receive the results in that case.
+    let _ = Python::try_attach(|py| loop {
         let bridge = queue.lock().last().map(|c| c.bridge.clone_ref(py));
         let Some(bridge) = bridge else {
             // An earlier drain already took everything. Release the flag, then

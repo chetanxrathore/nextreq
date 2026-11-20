@@ -1117,6 +1117,50 @@ def render_markdown(
     return "\n".join(out)
 
 
+README_START = "<!-- BENCHMARKS:START -->"
+README_END = "<!-- BENCHMARKS:END -->"
+
+
+def render_readme_block(
+    env: dict[str, Any],
+    params: dict[str, dict[str, int]],
+    results: dict[str, dict[str, dict[str, Any]]],
+) -> str:
+    """The benchmark summary embedded in README.md (between the markers)."""
+    versions = env["versions"]
+    competitors = ", ".join(f"{name} {versions[name]}" for name in ("requests", "httpx", "aiohttp"))
+    out = [
+        f"_{env['cpu']} · {env['python']} · nextreq {versions['nextreq']} vs {competitors} · "
+        f"{env['date']}. \"nextreq speedup\" is nextreq's throughput divided by that library's._",
+        "",
+    ]
+    for index, (key, rows) in enumerate(results.items(), start=1):
+        scenario = SCENARIOS[key]
+        out += [
+            f"**{index}. {scenario.title}** - {scenario.description.format(**params[key])}",
+            "",
+            *render_table(scenario, rows),
+            "",
+        ]
+    out += ["**Takeaways**", ""]
+    out += [f"- {point}" for point in takeaways(results)]
+    return "\n".join(out)
+
+
+def update_readme(block: str, readme: Path) -> bool:
+    """Replace the marked benchmark section of the README. Returns True if updated."""
+    if not readme.exists():
+        return False
+    text = readme.read_text(encoding="utf-8")
+    start, end = text.find(README_START), text.find(README_END)
+    if start < 0 or end < start:
+        return False
+    updated = text[: start + len(README_START)] + "\n" + block + "\n" + text[end:]
+    if updated != text:
+        readme.write_text(updated, encoding="utf-8")
+    return True
+
+
 def orchestrate(args: argparse.Namespace) -> int:
     selected = [s.strip() for s in args.only.split(",")] if args.only else list(SCENARIOS)
     unknown = [name for name in selected if name not in SCENARIOS]
@@ -1168,6 +1212,15 @@ def orchestrate(args: argparse.Namespace) -> int:
     raw_path.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"\nWrote {output}\nWrote {raw_path}", flush=True)
 
+    # Keep the README's benchmark section in sync with a full, default run.
+    complete = not args.quick and not args.only and output == (BENCH_DIR / "RESULTS.md").resolve()
+    if (
+        complete
+        and not args.no_readme
+        and update_readme(render_readme_block(env, params_used, results), ROOT / "README.md")
+    ):
+        print(f"Updated {ROOT / 'README.md'} (benchmark section)", flush=True)
+
     print()
     for key, rows in results.items():
         print(f"## {SCENARIOS[key].title}")
@@ -1198,6 +1251,11 @@ def main() -> int:
     parser.add_argument("--server", choices=("auto", "rust", "python"), default="auto")
     parser.add_argument(
         "--output", default=str(BENCH_DIR / "RESULTS.md"), help="Markdown report path"
+    )
+    parser.add_argument(
+        "--no-readme",
+        action="store_true",
+        help="do not refresh the benchmark section of README.md after a full run",
     )
     # Internal: per-library worker mode.
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
