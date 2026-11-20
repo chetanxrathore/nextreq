@@ -16,14 +16,15 @@ cookies, retries, hooks, typed parsing) still runs.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import inspect
 import io
 import json as _json
 import re
 import sys
-from collections.abc import Awaitable, Callable, Iterable, Mapping
-from typing import TYPE_CHECKING, Any, Union
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Literal, Union
 from urllib.parse import parse_qsl, unquote, unquote_to_bytes
 
 from .exceptions import NextReqError
@@ -463,7 +464,9 @@ class WSGITransport:
         client = nextreq.Client(app=flask_app)          # shorthand
         client = nextreq.Client(transport=WSGITransport(flask_app))
 
-    The response body is fully buffered.
+    With ``client.stream(...)`` the application's response is consumed as it
+    is produced, so streaming and Server-Sent Events endpoints can be tested
+    chunk by chunk; closing the response closes the application's iterable.
     """
 
     def __init__(
@@ -534,32 +537,95 @@ class WSGITransport:
             captured["headers"] = headers
             return written.append
 
+        result: Any = None
         try:
             result = self.app(environ, start_response)
-            try:
-                # Iterate first: legacy write() calls may happen during iteration.
-                iterated = b"".join(result)
-                body = b"".join(written) + iterated
-            finally:
-                closer = getattr(result, "close", None)
-                if callable(closer):
-                    closer()
+            chunks = iter(result)
+            # An application may call start_response() as late as its first
+            # chunk, so produce that one before reading the status.
+            first = next(chunks, None)
         except Exception:
+            _close_quietly(result)
             if self.raise_app_exceptions:
                 raise
             return Response(500, text="Internal Server Error", request=request)
         if "status" not in captured:
+            _close_quietly(result)
             raise RuntimeError("The WSGI application did not call start_response().")
         status_code = int(str(captured["status"]).split(" ", 1)[0])
-        return Response(status_code, headers=captured["headers"], content=body, request=request)
+        # Legacy write() output comes first, then the iterable.
+        ready = [*written, first] if first is not None else list(written)
+        body = _WSGIBody(result, chunks, ready, written, self.raise_app_exceptions)
+        return Response(status_code, headers=captured["headers"], stream=body, request=request)
 
     async def handle_async_request(self, request: Request) -> Response:
-        """Run the (blocking) WSGI app in a worker thread."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.handle_request, request)
+        """Run the (blocking) WSGI app in a worker thread, buffering its response."""
+
+        def run() -> Response:
+            response = self.handle_request(request)
+            response.read()
+            return response
+
+        return await asyncio.get_running_loop().run_in_executor(None, run)
 
     def close(self) -> None:
         """Nothing to release."""
+
+
+def _close_quietly(result: Any) -> None:
+    closer = getattr(result, "close", None)
+    if callable(closer):
+        with contextlib.suppress(Exception):
+            closer()
+
+
+class _WSGIBody:
+    """The body of a WSGI response, produced as the application yields it."""
+
+    def __init__(
+        self,
+        result: Any,
+        chunks: Iterator[bytes],
+        ready: list[bytes],
+        written: list[bytes],
+        raise_app_exceptions: bool,
+    ) -> None:
+        self._result = result
+        self._chunks = chunks
+        self._ready = ready
+        self._written = written
+        self._seen_writes = len(written)
+        self._raise = raise_app_exceptions
+        self._closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        try:
+            for chunk in self._ready:
+                if chunk:
+                    yield chunk
+            self._ready = []
+            while True:
+                try:
+                    chunk = next(self._chunks)
+                except StopIteration:
+                    break
+                except Exception:
+                    if self._raise:
+                        raise
+                    break  # the response is cut short, as a real server would do
+                # write() calls made while producing this chunk precede it.
+                late = self._written[self._seen_writes :]
+                self._seen_writes = len(self._written)
+                for piece in (*late, chunk):
+                    if piece:
+                        yield piece
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            _close_quietly(self._result)
 
 
 # -- ASGI ---------------------------------------------------------------------
@@ -572,16 +638,34 @@ def _is_asgi_app(app: Any) -> bool:
     return call is not None and inspect.iscoroutinefunction(call)
 
 
+#: Response chunks an ASGI application may produce ahead of the client.
+_ASGI_QUEUE_CHUNKS = 8
+#: How long a closed response waits for the application to notice the
+#: disconnect before its task is cancelled.
+_ASGI_DISCONNECT_GRACE = 0.2
+
+
 class ASGITransport:
     """Call an ASGI 3.0 application (FastAPI, Starlette, ...) in-process.
 
     ::
 
-        client = nextreq.AsyncClient(app=fastapi_app)   # shorthand
+        async with nextreq.AsyncClient(app=fastapi_app) as client:   # shorthand
+            ...
         client = nextreq.AsyncClient(transport=ASGITransport(fastapi_app))
 
-    The response body is buffered until the application finishes, and
-    lifespan events are not run.
+    **Streaming.** With ``client.stream(...)`` the response is delivered as the
+    application sends it, with backpressure, so streaming and Server-Sent
+    Events endpoints can be tested chunk by chunk. Closing the response tells
+    the application that the client disconnected.
+
+    **Lifespan.** The application's startup handlers run before the first
+    request and its shutdown handlers when the client is closed, so use the
+    client as a context manager. ``lifespan`` selects the behaviour:
+
+    * ``"auto"`` (default): run lifespan events if the application supports them;
+    * ``True``: run them and raise if the application does not support them;
+    * ``False``: never run them.
     """
 
     def __init__(
@@ -591,11 +675,18 @@ class ASGITransport:
         raise_app_exceptions: bool = True,
         root_path: str = "",
         client: tuple[str, int] = ("127.0.0.1", 50000),
+        lifespan: bool | Literal["auto"] = "auto",
     ) -> None:
+        if lifespan not in (True, False, "auto"):
+            raise ValueError("lifespan must be True, False or 'auto'")
         self.app = app
         self.raise_app_exceptions = raise_app_exceptions
         self.root_path = root_path
         self.client = client
+        self.lifespan = lifespan
+        #: State shared by the application's lifespan and its requests.
+        self.state: dict[str, Any] = {}
+        self._lifespan: _Lifespan | None = None
 
     def _scope(self, request: Request) -> dict[str, Any]:
         url = request.url
@@ -621,60 +712,239 @@ class ASGITransport:
             "server": (url.host or "testserver", port),
             "client": self.client,
             "extensions": {},
+            "state": self.state.copy(),
         }
 
+    async def _ensure_started(self) -> None:
+        """Run the application's startup handlers once per event loop."""
+        if self.lifespan is False:
+            return
+        loop = asyncio.get_running_loop()
+        current = self._lifespan
+        if current is not None and current.loop is loop:
+            return
+        # First request, or the client moved to a new event loop (the old
+        # lifespan task died with its loop).
+        self._lifespan = lifespan = _Lifespan(self.app, self.state, loop)
+        await lifespan.startup(required=self.lifespan is True)
+
     async def handle_async_request(self, request: Request) -> Response:
+        await self._ensure_started()
         scope = self._scope(request)
-        body_sent = False
-        response_complete = asyncio.Event()
-        status_code: int | None = None
-        response_headers: list[tuple[str, str]] = []
-        body_parts: list[bytes] = []
+        loop = asyncio.get_running_loop()
+        chunks: asyncio.Queue[bytes | BaseException | None] = asyncio.Queue(_ASGI_QUEUE_CHUNKS)
+        disconnected = asyncio.Event()
+        started: asyncio.Future[None] = loop.create_future()
+        head: dict[str, Any] = {}
+        request_delivered = False
+        finished = False
 
         async def receive() -> dict[str, Any]:
-            nonlocal body_sent
-            if not body_sent:
-                body_sent = True
+            nonlocal request_delivered
+            if not request_delivered:
+                request_delivered = True
                 return {"type": "http.request", "body": request.content, "more_body": False}
-            await response_complete.wait()
+            await disconnected.wait()
             return {"type": "http.disconnect"}
 
         async def send(message: Mapping[str, Any]) -> None:
-            nonlocal status_code
+            nonlocal finished
             kind = message["type"]
             if kind == "http.response.start":
-                status_code = int(message["status"])
-                response_headers.extend(
+                head["status"] = int(message["status"])
+                head["headers"] = [
                     (bytes(name).decode("latin-1").lower(), bytes(value).decode("latin-1"))
                     for name, value in message.get("headers", [])
-                )
-            elif kind == "http.response.body":
+                ]
+                if not started.done():
+                    started.set_result(None)
+            elif kind == "http.response.body" and not finished:
+                if disconnected.is_set():
+                    # Nobody is reading any more. Still give the event loop a
+                    # turn, so an application that keeps sending can be told
+                    # about the disconnect (or cancelled) instead of spinning.
+                    await asyncio.sleep(0)
+                    return
                 chunk = message.get("body", b"")
                 if chunk and request.method != "HEAD":
-                    body_parts.append(bytes(chunk))
+                    await chunks.put(bytes(chunk))  # waits while the client is behind
                 if not message.get("more_body", False):
-                    response_complete.set()
+                    finished = True
+                    await chunks.put(None)
 
+        async def run_app() -> None:
+            try:
+                await self.app(scope, receive, send)
+            except Exception as exc:
+                if not started.done():
+                    started.set_exception(exc)
+                elif not finished:
+                    await chunks.put(exc)
+                else:
+                    raise  # after a complete response: reported when the body ends
+            else:
+                if not started.done():
+                    started.set_exception(
+                        RuntimeError("The ASGI application returned without starting a response.")
+                    )
+                elif not finished:
+                    await chunks.put(None)  # the app ended the response by returning
+
+        task = loop.create_task(run_app())
         try:
-            await self.app(scope, receive, send)
+            await started
+        except RuntimeError:
+            raise
         except Exception:
             if self.raise_app_exceptions:
                 raise
-            response_complete.set()
-            if status_code is None:
-                return Response(500, text="Internal Server Error", request=request)
-        response_complete.set()
-        if status_code is None:
-            raise RuntimeError("The ASGI application returned without starting a response.")
-        return Response(
-            status_code,
-            headers=response_headers,
-            content=b"".join(body_parts),
-            request=request,
-        )
+            return Response(500, text="Internal Server Error", request=request)
+        except BaseException:
+            task.cancel()
+            raise
+        body = _ASGIBody(task, chunks, disconnected, self.raise_app_exceptions)
+        return Response(head["status"], headers=head["headers"], stream=body, request=request)
 
     async def aclose(self) -> None:
-        """Nothing to release."""
+        """Run the application's shutdown handlers (if startup ran)."""
+        lifespan, self._lifespan = self._lifespan, None
+        if lifespan is not None:
+            await lifespan.shutdown()
+
+
+class _ASGIBody:
+    """The body of an ASGI response, delivered as the application sends it."""
+
+    def __init__(
+        self,
+        task: asyncio.Task[None],
+        chunks: asyncio.Queue[bytes | BaseException | None],
+        disconnected: asyncio.Event,
+        raise_app_exceptions: bool,
+    ) -> None:
+        self._task = task
+        self._chunks = chunks
+        self._disconnected = disconnected
+        self._raise = raise_app_exceptions
+        self._done = False
+
+    def __aiter__(self) -> _ASGIBody:
+        return self
+
+    async def __anext__(self) -> bytes:
+        if self._done:
+            raise StopAsyncIteration
+        item = await self._chunks.get()
+        if isinstance(item, bytes):
+            return item
+        self._done = True
+        self._disconnected.set()
+        if isinstance(item, BaseException):
+            if self._raise:
+                raise item
+            raise StopAsyncIteration
+        # The response is complete. Let the application finish (it may still
+        # run background work), so its side effects are visible afterwards.
+        try:
+            await self._task
+        except Exception:
+            if self._raise:
+                raise
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        """The client is no longer interested: tell the application."""
+        if self._done:
+            return
+        self._done = True
+        self._disconnected.set()
+        while not self._chunks.empty():  # make room for a send() that is waiting
+            self._chunks.get_nowait()
+        if not self._task.done():
+            done, _ = await asyncio.wait({self._task}, timeout=_ASGI_DISCONNECT_GRACE)
+            if not done:
+                self._task.cancel()
+        with contextlib.suppress(BaseException):
+            await self._task
+
+
+class _Lifespan:
+    """Drives the ASGI lifespan protocol for one application on one loop."""
+
+    def __init__(
+        self, app: Callable[..., Any], state: dict[str, Any], loop: asyncio.AbstractEventLoop
+    ) -> None:
+        self.app = app
+        self.state = state
+        self.loop = loop
+        self._events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._started = asyncio.Event()
+        self._stopped = asyncio.Event()
+        self._failure: str | None = None
+        self._error: BaseException | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._active = False
+
+    async def _run(self) -> None:
+        async def receive() -> dict[str, Any]:
+            return await self._events.get()
+
+        async def send(message: Mapping[str, Any]) -> None:
+            kind = message["type"]
+            if kind == "lifespan.startup.complete":
+                self._started.set()
+            elif kind == "lifespan.startup.failed":
+                self._failure = str(message.get("message", "")) or "startup failed"
+                self._started.set()
+            elif kind == "lifespan.shutdown.complete":
+                self._stopped.set()
+            elif kind == "lifespan.shutdown.failed":
+                self._failure = str(message.get("message", "")) or "shutdown failed"
+                self._stopped.set()
+
+        scope = {
+            "type": "lifespan",
+            "asgi": {"version": "3.0", "spec_version": "2.0"},
+            "state": self.state,
+        }
+        try:
+            await self.app(scope, receive, send)
+        except BaseException as exc:
+            self._error = exc
+        finally:
+            self._started.set()
+            self._stopped.set()
+
+    async def startup(self, *, required: bool) -> None:
+        self._task = self.loop.create_task(self._run())
+        await self._events.put({"type": "lifespan.startup"})
+        await self._started.wait()
+        if self._failure is not None:
+            raise RuntimeError(f"ASGI lifespan startup failed: {self._failure}")
+        if self._task.done():
+            # The application returned or raised instead of running the
+            # lifespan protocol: it does not support it.
+            if required:
+                raise RuntimeError(
+                    "The ASGI application does not support the lifespan protocol."
+                ) from self._error
+            return
+        self._active = True
+
+    async def shutdown(self) -> None:
+        task = self._task
+        if not self._active or task is None or task.done():
+            return
+        if self.loop is not asyncio.get_running_loop():
+            return  # its event loop is gone; nothing can be run on it
+        self._active = False
+        self._failure = None
+        await self._events.put({"type": "lifespan.shutdown"})
+        await self._stopped.wait()
+        with contextlib.suppress(BaseException):
+            await task
+        if self._failure is not None:
+            raise RuntimeError(f"ASGI lifespan shutdown failed: {self._failure}")
 
 
 def _encode_header_value(value: str) -> bytes:

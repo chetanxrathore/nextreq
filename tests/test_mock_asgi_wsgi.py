@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import re
 from typing import Any
@@ -17,7 +18,7 @@ from nextreq.testing import ASGITransport, MockCall, MockRouteNotFound, WSGITran
 # postponed annotations), so its types must be importable at module level.
 try:
     import fastapi
-    from fastapi import Form, UploadFile
+    from fastapi import BackgroundTasks, Form, UploadFile
     from fastapi import Request as FastAPIRequest
 except ImportError:  # pragma: no cover - exercised only without the dev extras
     fastapi = None  # type: ignore[assignment]
@@ -605,7 +606,10 @@ async def test_asgi_raw_application_and_scope() -> None:
         response = await client.post("/caf%C3%A9/x", params={"k": "v"}, content=b"payload")
     assert response.text == "got:payload"
     assert response.headers.get_list("x-multi") == ["1", "2"]
-    scope = scopes[0]
+    # Like a real server, the transport first offers the lifespan protocol
+    # (which this bare application does not implement), then the request.
+    assert [scope["type"] for scope in scopes] == ["lifespan", "http"]
+    scope = scopes[1]
     assert scope["type"] == "http" and scope["asgi"]["version"] == "3.0"
     assert scope["method"] == "POST" and scope["scheme"] == "https"
     assert scope["path"] == "/café/x" and scope["raw_path"] == b"/caf%C3%A9/x"
@@ -787,3 +791,262 @@ async def test_wsgi_app_through_async_client(flask_app: Any) -> None:
 def test_asgi_app_passed_to_sync_client_is_rejected(fastapi_app: Any) -> None:
     with pytest.raises(TypeError, match="ASGI"):
         nextreq.Client(app=fastapi_app)
+
+
+# -- streaming and lifespan through the in-process transports ---------------------
+
+
+async def test_asgi_response_is_delivered_as_it_is_produced() -> None:
+    from fastapi import FastAPI
+    from fastapi.responses import StreamingResponse
+
+    app = FastAPI()
+    gate = asyncio.Event()
+    produced: list[str] = []
+
+    @app.get("/feed")
+    async def feed() -> Any:
+        async def generate() -> Any:
+            produced.append("first")
+            yield b"first\n"
+            await gate.wait()  # only continues once the client has seen "first"
+            produced.append("second")
+            yield b"second\n"
+
+        return StreamingResponse(generate(), media_type="text/plain")
+
+    async with nextreq.AsyncClient(app=app, base_url="http://app") as client:
+        async with client.stream("GET", "/feed") as response:
+            assert response.status_code == 200
+            chunks = response.aiter_bytes()
+            assert await chunks.__anext__() == b"first\n"
+            assert produced == ["first"]  # the rest has not been generated yet
+            gate.set()
+            assert [chunk async for chunk in chunks] == [b"second\n"]
+        assert produced == ["first", "second"]
+
+
+async def test_asgi_streaming_applies_backpressure_and_signals_disconnect() -> None:
+    from fastapi import FastAPI
+    from fastapi.responses import StreamingResponse
+
+    app = FastAPI()
+    produced = 0
+
+    @app.get("/endless")
+    async def endless() -> Any:
+        async def generate() -> Any:
+            nonlocal produced
+            while True:
+                produced += 1
+                yield b"x" * 1024
+
+        return StreamingResponse(generate())
+
+    async with nextreq.AsyncClient(app=app, base_url="http://app") as client:
+        async with client.stream("GET", "/endless") as response:
+            received = 0
+            async for _ in response.aiter_bytes():
+                received += 1
+                if received == 5:
+                    break
+            await asyncio.sleep(0.05)
+            # The generator is paused by the bounded queue, not running away.
+            assert produced < 5 + 16
+        # Closing the response disconnects the "client": the application stops
+        # producing instead of streaming into the void.
+        stopped_at = produced
+        await asyncio.sleep(0.1)
+        assert produced == stopped_at
+
+
+async def test_asgi_server_sent_events_arrive_incrementally(fastapi_app: Any) -> None:
+    async with nextreq.AsyncClient(app=fastapi_app, base_url="http://app") as client:
+        async with client.stream("GET", "/events") as response:
+            events = [event async for event in response.aiter_sse()]
+    assert len(events) >= 2
+    assert all(isinstance(event, nextreq.SSEEvent) for event in events)
+
+
+async def test_asgi_application_sees_the_disconnect() -> None:
+    seen: list[str] = []
+
+    async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            return
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"hello", "more_body": True})
+        seen.append((await receive())["type"])  # blocks until the client goes away
+
+    async with nextreq.AsyncClient(app=app, base_url="http://app") as client:
+        async with client.stream("GET", "/") as response:
+            assert await response.aiter_bytes().__anext__() == b"hello"
+            assert seen == []
+        assert seen == ["http.disconnect"]
+
+
+async def test_asgi_error_in_the_middle_of_a_response() -> None:
+    async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            return
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"partial", "more_body": True})
+        raise RuntimeError("generator blew up")
+
+    async with nextreq.AsyncClient(app=app, base_url="http://app") as client:
+        with pytest.raises(RuntimeError, match="generator blew up"):
+            await client.get("/")
+    quiet = ASGITransport(app, raise_app_exceptions=False)
+    async with nextreq.AsyncClient(transport=quiet, base_url="http://app") as client:
+        response = await client.get("/")
+        assert response.status_code == 200 and response.content == b"partial"
+
+
+async def test_asgi_background_work_finishes_before_the_response_is_returned() -> None:
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    done: list[str] = []
+
+    @app.post("/jobs")
+    async def create(background: BackgroundTasks) -> dict[str, bool]:
+        background.add_task(done.append, "sent email")
+        return {"queued": True}
+
+    async with nextreq.AsyncClient(app=app, base_url="http://app") as client:
+        assert (await client.post("/jobs")).json() == {"queued": True}
+        assert done == ["sent email"]
+
+
+async def test_asgi_lifespan_runs_startup_and_shutdown() -> None:
+    import contextlib
+
+    from fastapi import FastAPI
+
+    events: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI) -> Any:
+        events.append("startup")
+        yield {"database": "connected"}
+        events.append("shutdown")
+
+    app = FastAPI(lifespan=lifespan)
+
+    @app.get("/db")
+    async def db(request: FastAPIRequest) -> dict[str, str]:
+        return {"database": request.state.database}
+
+    @app.get("/ping")
+    async def ping() -> dict[str, bool]:
+        return {"pong": True}
+
+    async with nextreq.AsyncClient(app=app, base_url="http://app") as client:
+        assert events == []  # started with the first request
+        assert (await client.get("/db")).json() == {"database": "connected"}
+        assert (await client.get("/db")).status_code == 200
+        assert events == ["startup"]  # once, not per request
+    assert events == ["startup", "shutdown"]
+
+    # lifespan=False leaves the handlers alone.
+    events.clear()
+    transport = ASGITransport(app, lifespan=False)
+    async with nextreq.AsyncClient(transport=transport, base_url="http://app") as client:
+        assert (await client.get("/ping")).json() == {"pong": True}
+    assert events == []
+
+
+async def test_asgi_lifespan_failures_and_unsupported_applications() -> None:
+    import contextlib
+
+    from fastapi import FastAPI
+
+    @contextlib.asynccontextmanager
+    async def broken(app: FastAPI) -> Any:
+        raise RuntimeError("database unreachable")
+        yield
+
+    failing = FastAPI(lifespan=broken)
+    async with nextreq.AsyncClient(app=failing, base_url="http://app") as client:
+        with pytest.raises(RuntimeError, match="lifespan startup failed"):
+            await client.get("/")
+
+    async def bare(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        assert scope["type"] == "http"  # raises for the lifespan scope
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    # "auto" (the default) tolerates applications without lifespan support ...
+    async with nextreq.AsyncClient(app=bare, base_url="http://app") as client:
+        assert (await client.get("/")).status_code == 204
+    # ... while lifespan=True insists on it.
+    strict = ASGITransport(bare, lifespan=True)
+    async with nextreq.AsyncClient(transport=strict, base_url="http://app") as client:
+        with pytest.raises(RuntimeError, match="does not support the lifespan protocol"):
+            await client.get("/")
+    with pytest.raises(ValueError, match="lifespan must be"):
+        ASGITransport(bare, lifespan="sometimes")  # type: ignore[arg-type]
+
+
+def test_wsgi_response_is_consumed_lazily_and_closed_early() -> None:
+    produced: list[int] = []
+    closed: list[bool] = []
+
+    def app(environ: dict[str, Any], start_response: Any) -> Any:
+        def generate() -> Any:
+            try:
+                for n in range(1000):
+                    produced.append(n)
+                    yield f"chunk-{n}\n".encode()
+            finally:
+                closed.append(True)
+
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return generate()
+
+    with nextreq.Client(app=app, base_url="http://app") as client:
+        with client.stream("GET", "/") as response:
+            assert response.status_code == 200
+            chunks = response.iter_bytes()
+            assert next(chunks) == b"chunk-0\n"
+            assert next(chunks) == b"chunk-1\n"
+            assert len(produced) <= 3  # nothing was generated ahead of the reader
+        assert closed == [True]  # leaving the block closed the application's iterable
+        assert len(produced) <= 3
+
+        # Without stream=True the body is simply read to the end.
+        produced.clear()
+        assert client.get("/").text.count("chunk-") == 1000
+
+
+def test_wsgi_streamed_server_sent_events(flask_app: Any) -> None:
+    with nextreq.Client(app=flask_app, base_url="http://app") as client:
+        with client.stream("GET", "/stream") as response:
+            events = list(response.iter_sse())
+    assert len(events) >= 2
+
+
+def test_wsgi_legacy_write_callable_and_late_start_response() -> None:
+    def writer(environ: dict[str, Any], start_response: Any) -> Any:
+        write = start_response("200 OK", [("Content-Type", "text/plain")])
+        write(b"written-")
+        return [b"then-", b"iterated"]
+
+    def late(environ: dict[str, Any], start_response: Any) -> Any:
+        # start_response() is only called when the first chunk is requested.
+        def generate() -> Any:
+            start_response("201 Created", [("X-Late", "yes")])
+            yield b"late"
+
+        return generate()
+
+    with nextreq.Client(app=writer, base_url="http://app") as client:
+        assert client.get("/").content == b"written-then-iterated"
+    with nextreq.Client(app=late, base_url="http://app") as client:
+        response = client.get("/")
+        assert (response.status_code, response.headers["x-late"], response.content) == (
+            201,
+            "yes",
+            b"late",
+        )

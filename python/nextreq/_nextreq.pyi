@@ -1,7 +1,7 @@
 """Type stubs for the compiled Rust extension ``nextreq._nextreq``."""
 
-from asyncio import Future
-from collections.abc import Awaitable, Callable, Iterable
+from asyncio import AbstractEventLoop, Future
+from collections.abc import Awaitable, Iterable, Iterator
 from typing import Any, Final, final
 
 __version__: Final[str]
@@ -153,16 +153,39 @@ class ResponseStream:
 class LoopBridge:
     """Batches results from the Tokio runtime onto one asyncio event loop."""
 
-    def __init__(self, call_soon_threadsafe: Callable[..., Any]) -> None: ...
     def drain(self) -> None: ...
     @property
     def pending(self) -> int: ...
+
+def loop_bridge(event_loop: AbstractEventLoop) -> LoopBridge:
+    """The bridge of ``event_loop`` (one per loop, created on first use)."""
+
+def request_target(url: str) -> str:
+    """The request target (``/path?query``) as sent on the wire for ``url``."""
+
+def after_fork_in_child() -> None:
+    """Abandon the parent's I/O runtime in a forked child (see ``os.register_at_fork``)."""
+
+def is_public_suffix(domain: str) -> bool:
+    """Whether ``domain`` is a public suffix (``com``, ``co.uk``, ``github.io``)."""
+
+@final
+class UploadStream:
+    """The producing side of a streamed request body (``AsyncClient``)."""
+
+    def __init__(self) -> None: ...
+    def try_send(self, chunk: bytes) -> int:
+        """0 = queued, 1 = queue full (use ``send``), 2 = the body is no longer wanted."""
+    def send(self, chunk: bytes) -> Awaitable[bool]: ...
+    def finish(self) -> None: ...
+    def fail(self) -> None: ...
 
 @final
 class TaskHandle:
     """Handle to an in-flight asynchronous request."""
 
     def abort(self) -> None: ...
+    def abort_if_cancelled(self, future: Future[Any]) -> None: ...
     @property
     def is_finished(self) -> bool: ...
 
@@ -171,14 +194,21 @@ class WebSocketConnection:
     """An open WebSocket connection."""
 
     def send_text(self, text: str) -> Awaitable[None]: ...
+    def send_text_blocking(self, text: str) -> None: ...
     def send_bytes(self, data: bytes) -> Awaitable[None]: ...
+    def send_bytes_blocking(self, data: bytes) -> None: ...
     def ping(self, data: bytes = b"") -> Awaitable[None]: ...
+    def ping_blocking(self, data: bytes = b"") -> None: ...
     def receive(self) -> Awaitable[WebSocketMessage]: ...
+    def receive_blocking(self, timeout: float | None = None) -> WebSocketMessage: ...
     def close(self, code: int = 1000, reason: str = "") -> Awaitable[None]: ...
+    def close_blocking(self, code: int = 1000, reason: str = "") -> None: ...
     @property
     def subprotocol(self) -> str | None: ...
     @property
     def response_headers(self) -> list[tuple[str, str]]: ...
+    @property
+    def compressed(self) -> bool: ...
 
 @final
 class HttpClient:
@@ -205,7 +235,7 @@ class HttpClient:
         method: str,
         url: str,
         headers: Iterable[tuple[str, str]],
-        body: bytes | None = None,
+        body: bytes | Iterator[bytes] | None = None,
         timeout: Timeout | None = None,
         stream: bool = False,
     ) -> RawResponse: ...
@@ -216,7 +246,7 @@ class HttpClient:
         method: str,
         url: str,
         headers: Iterable[tuple[str, str]],
-        body: bytes | None = None,
+        body: bytes | UploadStream | None = None,
         timeout: Timeout | None = None,
         stream: bool = False,
     ) -> TaskHandle:
@@ -228,7 +258,17 @@ class HttpClient:
         subprotocols: list[str] | None = None,
         timeout: Timeout | None = None,
         max_message_size: int | None = None,
+        compression: bool = False,
     ) -> Awaitable[WebSocketConnection]: ...
+    def ws_connect_blocking(
+        self,
+        url: str,
+        headers: list[tuple[str, str]],
+        subprotocols: list[str] | None = None,
+        timeout: Timeout | None = None,
+        max_message_size: int | None = None,
+        compression: bool = False,
+    ) -> WebSocketConnection: ...
     def close(self) -> None: ...
     @property
     def is_closed(self) -> bool: ...

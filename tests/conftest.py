@@ -11,7 +11,10 @@ import asyncio
 import base64
 import contextlib
 import gzip
+import hashlib
 import json
+import os
+import re
 import socket
 import threading
 import zlib
@@ -70,6 +73,9 @@ class LiveServer:
 
     def __init__(self) -> None:
         self.flaky: Counter[str] = Counter()
+        #: Digest auth: highest nonce count seen per issued nonce.
+        self.digest_nonces: dict[str, int] = {}
+        self.digest_requests = 0
         self.peers: set[Any] = set()
         self.inflight = 0
         self.max_inflight = 0
@@ -113,6 +119,8 @@ class LiveServer:
 
     def reset(self) -> None:
         self.flaky.clear()
+        self.digest_nonces.clear()
+        self.digest_requests = 0
         self.peers.clear()
         self.inflight = 0
         self.max_inflight = 0
@@ -150,13 +158,16 @@ class LiveServer:
         r.add_get("/drop", self.drop)
         r.add_route("*", "/drop-then-ok/{key}", self.drop_then_ok)
         r.add_post("/upload", self.upload)
+        r.add_route("*", "/digest", self.digest)
         r.add_get("/basic-auth/{user}/{password}", self.basic_auth)
+        r.add_route("*", "/digest-auth/{user}/{password}", self.digest_auth)
         r.add_get("/users/{user_id}", self.user)
         r.add_get("/users", self.users)
         r.add_get("/large", self.large)
         r.add_get("/latin1-header", self.latin1_header)
         r.add_get("/ws", self.ws)
         r.add_get("/ws-headers", self.ws_headers)
+        r.add_get("/ws-heartbeat", self.ws_heartbeat)
         r.add_get("/ws-close", self.ws_close)
         return app
 
@@ -349,6 +360,107 @@ class LiveServer:
                 fields[name] = data.decode("utf-8")
         return web.json_response({"fields": fields, "files": files})
 
+    async def digest(self, request: web.Request) -> web.Response:
+        """Consume the body in chunks (never holding it whole) and describe it.
+
+        ``?key=K&fail=N`` answers the first N requests for K with a 503, and
+        ``?redirect=STATUS`` answers with that redirect back to this endpoint.
+        """
+        size = 0
+        sha256 = hashlib.sha256()
+        async for chunk in request.content.iter_chunked(64 * 1024):
+            size += len(chunk)
+            sha256.update(chunk)
+        payload = {
+            "method": request.method,
+            "size": size,
+            "sha256": sha256.hexdigest(),
+            "content_length": request.headers.get("Content-Length"),
+            "transfer_encoding": request.headers.get("Transfer-Encoding"),
+            "content_type": request.headers.get("Content-Type"),
+        }
+        if "redirect" in request.query:
+            return web.Response(
+                status=int(request.query["redirect"]), headers={"Location": "/digest"}
+            )
+        if "key" in request.query:
+            self.flaky[request.query["key"]] += 1
+            payload["attempt"] = self.flaky[request.query["key"]]
+            if payload["attempt"] <= int(request.query.get("fail", "1")):
+                return web.json_response(payload, status=503)
+        return web.json_response(payload)
+
+    async def digest_auth(self, request: web.Request) -> web.Response:
+        """A Digest-protected resource (RFC 7616), verified independently of the client.
+
+        Query: ``algorithm`` (default MD5), ``qop`` (default ``auth``; empty for
+        RFC 2069), ``expire=1`` (every nonce is accepted only once, then stale),
+        ``extra=1`` (also offer Basic in the same header).
+        """
+        self.digest_requests += 1
+        body = await request.read()
+        user, password = request.match_info["user"], request.match_info["password"]
+        algorithm = request.query.get("algorithm", "MD5")
+        qop = request.query.get("qop", "auth")
+        realm = "nextreq tests"
+
+        def challenge(stale: bool = False) -> web.Response:
+            nonce = os.urandom(12).hex()
+            self.digest_nonces[nonce] = 0
+            value = f'Digest realm="{realm}", nonce="{nonce}", opaque="0pa\\"que", algorithm={algorithm}'
+            if qop:
+                value += f', qop="{qop}"'
+            if stale:
+                value += ", stale=true"
+            if "extra" in request.query:
+                value = 'Basic realm="other", ' + value
+            return web.json_response(
+                {"authenticated": False}, status=401, headers={"WWW-Authenticate": value}
+            )
+
+        header = request.headers.get("Authorization", "")
+        if not header.lower().startswith("digest "):
+            return challenge()
+        given = {
+            key.lower(): value[1:-1].replace('\\"', '"') if value.startswith('"') else value
+            for key, value in re.findall(r'([\w-]+)=("(?:[^"\\]|\\.)*"|[^\s,]+)', header[7:])
+        }
+        nonce = given.get("nonce", "")
+        if nonce not in self.digest_nonces:
+            return challenge(stale=True)
+        base = algorithm.upper().removesuffix("-SESS")
+        hash_name = {"MD5": "md5", "SHA": "sha1", "SHA-256": "sha256", "SHA-512": "sha512"}[base]
+
+        def digest(text: str) -> str:
+            return hashlib.new(hash_name, text.encode()).hexdigest()
+
+        ha1 = digest(f"{user}:{realm}:{password}")
+        if algorithm.upper().endswith("-SESS"):
+            ha1 = digest(f"{ha1}:{nonce}:{given.get('cnonce', '')}")
+        ha2 = digest(f"{request.method}:{given.get('uri', '')}")
+        if qop:
+            count = int(given.get("nc", "0"), 16)
+            if count <= self.digest_nonces[nonce]:
+                return challenge()  # a replayed nonce count
+            expected = digest(f"{ha1}:{nonce}:{given['nc']}:{given['cnonce']}:{given['qop']}:{ha2}")
+        else:
+            count = self.digest_nonces[nonce] + 1
+            expected = digest(f"{ha1}:{nonce}:{ha2}")
+        valid = (
+            given.get("response") == expected
+            and given.get("uri") == request.raw_path
+            and given.get("username") == user
+            and given.get("opaque") == '0pa"que'
+        )
+        if not valid:
+            return challenge()
+        self.digest_nonces[nonce] = count
+        if "expire" in request.query:
+            del self.digest_nonces[nonce]
+        return web.json_response(
+            {"authenticated": True, "nc": given.get("nc"), "body": body.decode(), "user": user}
+        )
+
     async def basic_auth(self, request: web.Request) -> web.Response:
         expected = base64.b64encode(
             f"{request.match_info['user']}:{request.match_info['password']}".encode()
@@ -400,9 +512,22 @@ class LiveServer:
                 if message.data == "close-me":
                     await socket_.close(code=4001, message=b"server says bye")
                     break
+                if message.data == "compressed?":
+                    # Non-zero when permessage-deflate was negotiated.
+                    await socket_.send_str(f"compressed:{bool(socket_.compress)}")
+                    continue
                 await socket_.send_str(f"echo:{message.data}")
             elif message.type == WSMsgType.BINARY:
                 await socket_.send_bytes(message.data)
+        return socket_
+
+    async def ws_heartbeat(self, request: web.Request) -> web.WebSocketResponse:
+        """Pings every 0.2 s and drops the connection if a pong is missed."""
+        socket_ = web.WebSocketResponse(heartbeat=0.2)
+        await socket_.prepare(request)
+        async for message in socket_:
+            if message.type == WSMsgType.TEXT:
+                await socket_.send_str(f"echo:{message.data}")
         return socket_
 
     async def ws_headers(self, request: web.Request) -> web.WebSocketResponse:
@@ -528,6 +653,15 @@ class TLSServer:
 
     @staticmethod
     async def _app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "websocket" and scope["path"] == "/ws-echo":
+            await receive()  # websocket.connect
+            await send({"type": "websocket.accept"})
+            while (message := await receive())["type"] == "websocket.receive":
+                if message.get("text") is not None:
+                    await send({"type": "websocket.send", "text": "tls:" + message["text"]})
+                else:
+                    await send({"type": "websocket.send", "bytes": message["bytes"]})
+            return
         if scope["type"] != "http":
             return
         body = json.dumps(
@@ -605,10 +739,15 @@ def tls_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[TLSServer]:
 
 
 class ProxyServer:
-    """A minimal HTTP forward proxy that records the requests it relays."""
+    """A minimal HTTP forward proxy that records the requests it relays.
+
+    Plain ``http://`` targets are forwarded; ``CONNECT`` opens a raw tunnel.
+    """
 
     def __init__(self) -> None:
         self.requests: list[str] = []
+        #: Headers of the most recent request, lower-cased names.
+        self.last_headers: dict[str, str] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ready = threading.Event()
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -625,6 +764,15 @@ class ProxyServer:
             request_line, _, rest = head.partition(b"\r\n")
             method, target, _version = request_line.decode("latin-1").split(" ", 2)
             self.requests.append(f"{method} {target}")
+            self.last_headers = {
+                name.strip().lower(): value.strip()
+                for name, _, value in (
+                    line.decode("latin-1").partition(":") for line in rest.split(b"\r\n") if line
+                )
+            }
+            if method == "CONNECT":
+                await self._tunnel(target, reader, writer)
+                return
             if not target.startswith("http://"):
                 writer.write(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
                 await writer.drain()
@@ -659,6 +807,27 @@ class ProxyServer:
         finally:
             with contextlib.suppress(Exception):
                 writer.close()
+
+    async def _tunnel(
+        self, target: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        host, _, port = target.rpartition(":")
+        upstream_reader, upstream_writer = await asyncio.open_connection(host, int(port))
+        writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        await writer.drain()
+
+        async def pipe(source: asyncio.StreamReader, sink: asyncio.StreamWriter) -> None:
+            try:
+                while chunk := await source.read(65536):
+                    sink.write(chunk)
+                    await sink.drain()
+            except (ConnectionError, asyncio.CancelledError):
+                pass
+            finally:
+                with contextlib.suppress(Exception):
+                    sink.close()
+
+        await asyncio.gather(pipe(reader, upstream_writer), pipe(upstream_reader, writer))
 
     def _run(self) -> None:
         loop = asyncio.new_event_loop()

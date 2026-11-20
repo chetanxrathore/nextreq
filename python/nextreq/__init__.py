@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import os as _os
+
 from . import _nextreq
 from ._nextreq import HTTP3_ENABLED, RetryPolicy, Timeout, parse_retry_after
 from .client import (
@@ -26,6 +28,8 @@ from .client import (
     BasicAuth,
     BearerAuth,
     Client,
+    DigestAuth,
+    SyncWebSocket,
     Transport,
     WebSocket,
     delete,
@@ -69,10 +73,16 @@ from .exceptions import (
     WriteError,
     WriteTimeout,
 )
-from .models import URL, Cookies, Elapsed, Headers, Request, Response, SSEEvent
+from .models import URL, Cookies, Elapsed, Headers, Request, RequestStream, Response, SSEEvent
 from .testing import ASGITransport, MockRouteNotFound, MockTransport, WSGITransport
 
 __version__: str = _nextreq.__version__
+
+# The I/O runtime's threads do not survive os.fork(). Tell the extension when
+# this process is a forked child, so it starts a fresh runtime and rebuilds
+# connection pools on first use instead of waiting on threads that are gone.
+if hasattr(_os, "register_at_fork"):
+    _os.register_at_fork(after_in_child=_nextreq.after_fork_in_child)
 
 __all__ = [
     "HTTP3_ENABLED",
@@ -90,6 +100,7 @@ __all__ = [
     "Cookies",
     "DecodeError",
     "DecodingError",
+    "DigestAuth",
     "Elapsed",
     "HTTPStatusError",
     "Headers",
@@ -106,6 +117,7 @@ __all__ = [
     "ReadTimeout",
     "RemoteProtocolError",
     "Request",
+    "RequestStream",
     "Response",
     "ResponseNotRead",
     "RetryPolicy",
@@ -113,6 +125,7 @@ __all__ = [
     "StreamClosed",
     "StreamConsumed",
     "StreamError",
+    "SyncWebSocket",
     "Timeout",
     "TimeoutException",
     "TooManyRedirects",

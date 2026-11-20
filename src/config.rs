@@ -743,6 +743,21 @@ pub fn build_tls_config(options: &TlsOptions, alpn: &[&[u8]]) -> NxResult<Client
     Ok(config)
 }
 
+/// Whether `domain` is a public suffix - a name under which unrelated parties
+/// register domains, such as `com`, `co.uk` or `github.io` - according to the
+/// Public Suffix List compiled into this build.
+///
+/// Following the list's default rule, a single label that is not listed
+/// (`localhost`, `internal`) counts as a public suffix. IP addresses do not.
+#[pyfunction]
+pub fn is_public_suffix(domain: &str) -> bool {
+    let domain = domain.trim_matches('.').to_ascii_lowercase();
+    if domain.is_empty() || domain.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    psl::suffix(domain.as_bytes()).is_some_and(|suffix| suffix.as_bytes().len() == domain.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

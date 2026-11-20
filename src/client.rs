@@ -7,7 +7,10 @@
 //! * The sync path parks the calling Python thread in `Runtime::block_on` with
 //!   the interpreter *detached* (GIL released), waking every 100 ms only to let
 //!   Python deliver signals such as Ctrl-C.
-//! * The async path hands a Rust future to asyncio via `pyo3-async-runtimes`.
+//! * The async path runs the request on the runtime and resolves an
+//!   `asyncio.Future` through [`LoopBridge`], which batches completions.
+//! * The runtime is owned here (not by a helper crate) so that it can be
+//!   replaced in a child process after `os.fork()`.
 //! * Everything between "request prepared" and "response ready" is pure Rust and
 //!   never touches the interpreter.
 //! * Timeouts are enforced per request (not per client) so they can be
@@ -19,7 +22,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -29,6 +32,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, Version};
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyList, PyString, PyTuple};
 use pyo3::IntoPyObjectExt;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -51,9 +55,15 @@ const SIGNAL_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 // Runtime
 // ---------------------------------------------------------------------------
 
-/// Configure the shared Tokio runtime. Called once at module import.
-pub fn init_runtime() {
-    let workers = std::env::var("NEXTREQ_WORKER_THREADS")
+/// The live runtime. Leaked on purpose: it lives as long as the process, and
+/// after a fork the parent's instance must never be dropped in the child.
+static RUNTIME: AtomicPtr<tokio::runtime::Runtime> = AtomicPtr::new(std::ptr::null_mut());
+/// Bumped in the child after every `os.fork()`; engines built under an older
+/// generation rebuild themselves on first use.
+static FORK_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn worker_threads() -> usize {
+    std::env::var("NEXTREQ_WORKER_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
@@ -65,18 +75,59 @@ pub fn init_runtime() {
             // Python thread, so a few workers are plenty; more only adds
             // work-stealing churn (measured: 4 is the sweet spot).
             cores.clamp(2, 4)
-        });
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder
-        .worker_threads(workers)
-        .thread_name("nextreq-io")
-        .enable_all();
-    pyo3_async_runtimes::tokio::init(builder);
+        })
 }
 
-/// The shared multi-threaded runtime.
+fn build_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads())
+        .thread_name("nextreq-io")
+        .enable_all()
+        .build()
+        .expect("failed to start the nextreq I/O runtime")
+}
+
+/// The shared multi-threaded runtime, started on first use.
 pub fn runtime() -> &'static tokio::runtime::Runtime {
-    pyo3_async_runtimes::tokio::get_runtime()
+    let existing = RUNTIME.load(Ordering::Acquire);
+    if !existing.is_null() {
+        // SAFETY: a published runtime is never freed (see `RUNTIME`).
+        return unsafe { &*existing };
+    }
+    let fresh = Box::into_raw(Box::new(build_runtime()));
+    match RUNTIME.compare_exchange(
+        std::ptr::null_mut(),
+        fresh,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        // SAFETY: `fresh` was just leaked and is now the published runtime.
+        Ok(_) => unsafe { &*fresh },
+        Err(winner) => {
+            // Another thread started the runtime first; discard ours.
+            // SAFETY: `fresh` was never published, so this is the only owner.
+            unsafe { Box::from_raw(fresh) }.shutdown_background();
+            // SAFETY: as above, a published runtime is never freed.
+            unsafe { &*winner }
+        }
+    }
+}
+
+/// How many times this process image has been forked since nextreq loaded.
+pub fn fork_generation() -> u64 {
+    FORK_GENERATION.load(Ordering::Acquire)
+}
+
+/// Reset per-process state in the child after `os.fork()`.
+///
+/// Only the forking thread exists in the child, so the parent's runtime (its
+/// worker threads, timers and connection tasks) is dead there. It is
+/// abandoned rather than dropped, because its locks may have been held by
+/// threads that no longer exist; a new runtime starts on the next request.
+#[pyfunction]
+pub fn after_fork_in_child() {
+    RUNTIME.store(std::ptr::null_mut(), Ordering::Release);
+    FORK_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Run `fut` to completion on the shared runtime with the interpreter detached.
@@ -125,11 +176,10 @@ where
 // asyncio completion bridge
 // ---------------------------------------------------------------------------
 //
-// `pyo3-async-runtimes` is used for the shared runtime and for low-frequency
-// awaitables (WebSockets, stream reads). The request hot path uses this
-// purpose-built bridge instead, because under high concurrency the generic
-// bridge pays, per request, two task spawns, a blocking-pool hop and a GIL
-// acquisition from a foreign thread (which fights the event loop for the GIL).
+// Every awaitable this extension hands to Python is an `asyncio.Future`
+// resolved through this bridge. Resolving each future on its own would cost,
+// per result, a GIL acquisition from a foreign thread (which fights the event
+// loop for the GIL) and a loop wake-up.
 //
 // Here a finished request is pushed onto a queue *without touching the
 // interpreter*. The first completion after the queue was last drained
@@ -188,11 +238,12 @@ fn wake_event_loop(queue: &BridgeQueue) {
             continue;
         };
         let bridge = bridge.bind(py);
-        let scheduled = bridge
-            .getattr(intern!(py, "drain"))
-            .and_then(|drain| bridge.get().call_soon_threadsafe.bind(py).call1((drain,)));
+        let scheduled = bridge.getattr(intern!(py, "drain")).and_then(|drain| {
+            let event_loop = bridge.get().event_loop.bind(py).call0()?;
+            event_loop.call_method1(intern!(py, "call_soon_threadsafe"), (drain,))
+        });
         if scheduled.is_err() {
-            // The event loop is closed, so nobody can await these results.
+            // The event loop is closed or gone, so nobody can await these results.
             let orphaned = std::mem::take(&mut *queue.lock());
             queue.wake_scheduled.store(false, Ordering::Release);
             drop(orphaned);
@@ -203,11 +254,78 @@ fn wake_event_loop(queue: &BridgeQueue) {
 
 /// Batches results from the Tokio runtime onto one asyncio event loop.
 ///
-/// Create one per event loop with `LoopBridge(loop.call_soon_threadsafe)`.
+/// There is one per event loop; get it with `loop_bridge(loop)`.
 #[pyclass(frozen, module = "nextreq._nextreq", name = "LoopBridge")]
 pub struct LoopBridge {
     queue: Arc<BridgeQueue>,
-    call_soon_threadsafe: Py<PyAny>,
+    /// `weakref.ref(loop)`: the bridge is cached per loop, so a strong
+    /// reference here would keep every loop ever used alive.
+    event_loop: Py<PyAny>,
+}
+
+static GET_RUNNING_LOOP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static WEAKREF_REF: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+/// `WeakKeyDictionary[loop, LoopBridge]`.
+static BRIDGES: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+/// The bridge of `event_loop`, created on first use.
+#[pyfunction]
+pub fn loop_bridge<'py>(
+    py: Python<'py>,
+    event_loop: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, LoopBridge>> {
+    let bridges = BRIDGES
+        .get_or_try_init(py, || {
+            py.import("weakref")?
+                .getattr("WeakKeyDictionary")?
+                .call0()
+                .map(Bound::unbind)
+        })?
+        .bind(py);
+    let existing = bridges.call_method1(intern!(py, "get"), (event_loop,))?;
+    if let Ok(bridge) = existing.cast_into::<LoopBridge>() {
+        return Ok(bridge);
+    }
+    let weakref = WEAKREF_REF
+        .get_or_try_init(py, || {
+            py.import("weakref")?.getattr("ref").map(Bound::unbind)
+        })?
+        .bind(py);
+    let bridge = Bound::new(
+        py,
+        LoopBridge {
+            queue: Arc::new(BridgeQueue::default()),
+            event_loop: weakref.call1((event_loop,))?.unbind(),
+        },
+    )?;
+    bridges.set_item(event_loop, &bridge)?;
+    Ok(bridge)
+}
+
+/// Run `work` on the runtime and return an awaitable for its result: an
+/// `asyncio.Future` on the running event loop. Cancelling the future aborts
+/// the work.
+pub fn spawn_awaitable<'py, F, T>(py: Python<'py>, work: F) -> PyResult<Bound<'py, PyAny>>
+where
+    F: Future<Output = NxResult<T>> + Send + 'static,
+    T: for<'a> IntoPyObject<'a> + Send + 'static,
+{
+    let event_loop = GET_RUNNING_LOOP
+        .get_or_try_init(py, || {
+            py.import("asyncio")?
+                .getattr("get_running_loop")
+                .map(Bound::unbind)
+        })?
+        .bind(py)
+        .call0()?;
+    let bridge = loop_bridge(py, &event_loop)?;
+    let future = event_loop.call_method0(intern!(py, "create_future"))?;
+    let handle = Bound::new(py, LoopBridge::spawn(&bridge, &future, work))?;
+    future.call_method1(
+        intern!(py, "add_done_callback"),
+        (handle.getattr(intern!(py, "abort_if_cancelled"))?,),
+    )?;
+    Ok(future)
 }
 
 impl LoopBridge {
@@ -236,14 +354,6 @@ impl LoopBridge {
 
 #[pymethods]
 impl LoopBridge {
-    #[new]
-    fn py_new(call_soon_threadsafe: Py<PyAny>) -> Self {
-        LoopBridge {
-            queue: Arc::new(BridgeQueue::default()),
-            call_soon_threadsafe,
-        }
-    }
-
     /// Resolve every queued future. Runs on the event-loop thread.
     fn drain(&self, py: Python<'_>) {
         loop {
@@ -299,6 +409,17 @@ impl TaskHandle {
         self.abort.abort();
     }
 
+    /// Done-callback for the future: stop the work if nobody awaits it.
+    fn abort_if_cancelled(&self, future: &Bound<'_, PyAny>) -> PyResult<()> {
+        if future
+            .call_method0(intern!(future.py(), "cancelled"))?
+            .is_truthy()?
+        {
+            self.abort.abort();
+        }
+        Ok(())
+    }
+
     #[getter]
     fn is_finished(&self) -> bool {
         self.abort.is_finished()
@@ -323,6 +444,9 @@ pub struct RequestCtx {
     connect_end: AtomicU64,
     progress: AtomicU64,
     body_done: AtomicBool,
+    /// A streamed request body has no chunk ready: the upload is waiting for
+    /// the application, not for the network, so the write timeout is paused.
+    producer_waiting: AtomicBool,
     notify: Notify,
 }
 
@@ -335,6 +459,7 @@ impl RequestCtx {
             connect_end: AtomicU64::new(0),
             progress: AtomicU64::new(0),
             body_done: AtomicBool::new(!has_tracked_body),
+            producer_waiting: AtomicBool::new(false),
             notify: Notify::new(),
         }
     }
@@ -358,8 +483,22 @@ impl RequestCtx {
         self.notify.notify_one();
     }
 
+    fn mark_producer_waiting(&self) {
+        self.producer_waiting.store(true, Ordering::Relaxed);
+    }
+
+    /// A chunk of a streamed body was handed to the connection.
+    fn mark_chunk_sent(&self) {
+        self.touch();
+        if self.producer_waiting.swap(false, Ordering::Relaxed) {
+            // The write clock restarts now; let the watchdog re-arm.
+            self.notify.notify_one();
+        }
+    }
+
     fn mark_body_done(&self) {
         self.touch();
+        self.producer_waiting.store(false, Ordering::Relaxed);
         if !self.body_done.swap(true, Ordering::Relaxed) {
             self.notify.notify_one();
         }
@@ -378,6 +517,9 @@ impl RequestCtx {
         let (phase_timeout, kind) = if self.body_done.load(Ordering::Relaxed) {
             (t.read?, ErrorKind::ReadTimeout)
         } else {
+            if self.producer_waiting.load(Ordering::Relaxed) {
+                return None;
+            }
             (t.write?, ErrorKind::WriteTimeout)
         };
         let begin = self.connect_begin.load(Ordering::Relaxed);
@@ -492,6 +634,245 @@ impl http_body::Body for TrackedBody {
 }
 
 // ---------------------------------------------------------------------------
+// Streamed request bodies
+// ---------------------------------------------------------------------------
+
+/// How many chunks a streamed request body may queue ahead of the socket.
+const UPLOAD_QUEUE_CHUNKS: usize = 4;
+
+#[derive(Default)]
+struct UploadState {
+    /// Set when the producer reached the end of the body. A channel that
+    /// closes without it means the body was cut short, which must fail the
+    /// request instead of looking like a complete (truncated) upload.
+    finished: AtomicBool,
+}
+
+/// A request body fed chunk by chunk through a bounded channel, so only a
+/// few chunks are ever held in memory and a slow connection applies
+/// backpressure to whatever produces the data.
+struct ChannelBody {
+    chunks: tokio::sync::mpsc::Receiver<Bytes>,
+    state: Arc<UploadState>,
+    ctx: Arc<RequestCtx>,
+    done: bool,
+}
+
+impl http_body::Body for ChannelBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        match self.chunks.poll_recv(cx) {
+            Poll::Pending => {
+                self.ctx.mark_producer_waiting();
+                Poll::Pending
+            }
+            Poll::Ready(Some(chunk)) => {
+                self.ctx.mark_chunk_sent();
+                Poll::Ready(Some(Ok(http_body::Frame::data(chunk))))
+            }
+            Poll::Ready(None) => {
+                self.done = true;
+                if self.state.finished.load(Ordering::Acquire) {
+                    self.ctx.mark_body_done();
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Err(
+                        "the request body ended before it was complete".into()
+                    )))
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done
+    }
+}
+
+/// The producing side of a streamed request body, for `AsyncClient`: Python
+/// pushes chunks as its (async) iterator yields them.
+///
+/// Create one, pass it as the `body` of `HttpClient.send_async`, then feed it
+/// and call `finish()`. Dropping it without `finish()` fails the request.
+#[pyclass(frozen, module = "nextreq._nextreq", name = "UploadStream")]
+pub struct UploadStream {
+    sender: Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>,
+    receiver: Mutex<Option<tokio::sync::mpsc::Receiver<Bytes>>>,
+    state: Arc<UploadState>,
+}
+
+impl UploadStream {
+    fn sender(&self) -> Option<tokio::sync::mpsc::Sender<Bytes>> {
+        self.sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+#[pymethods]
+impl UploadStream {
+    #[new]
+    fn py_new() -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_QUEUE_CHUNKS);
+        UploadStream {
+            sender: Mutex::new(Some(sender)),
+            receiver: Mutex::new(Some(receiver)),
+            state: Arc::new(UploadState::default()),
+        }
+    }
+
+    /// Queue a chunk without waiting: 0 = queued, 1 = the queue is full (use
+    /// `send`), 2 = the request no longer wants the body.
+    fn try_send(&self, chunk: PyBackedBytes) -> u8 {
+        use tokio::sync::mpsc::error::TrySendError;
+        let Some(sender) = self.sender() else {
+            return 2;
+        };
+        if chunk.is_empty() {
+            return 0;
+        }
+        match sender.try_send(Bytes::copy_from_slice(&chunk)) {
+            Ok(()) => 0,
+            Err(TrySendError::Full(_)) => 1,
+            Err(TrySendError::Closed(_)) => 2,
+        }
+    }
+
+    /// Queue a chunk, waiting for room. The awaitable resolves to `False`
+    /// when the request no longer wants the body.
+    fn send<'py>(&self, py: Python<'py>, chunk: PyBackedBytes) -> PyResult<Bound<'py, PyAny>> {
+        let sender = self.sender();
+        let chunk = Bytes::copy_from_slice(&chunk);
+        spawn_awaitable(py, async move {
+            let delivered = match sender {
+                Some(sender) => sender.send(chunk).await.is_ok(),
+                None => false,
+            };
+            Ok::<bool, NxError>(delivered)
+        })
+    }
+
+    /// The body is complete.
+    fn finish(&self) {
+        self.state.finished.store(true, Ordering::Release);
+        *self.sender.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The body could not be produced: fail the request.
+    fn fail(&self) {
+        *self.sender.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// The next non-empty chunk of a Python iterator of `bytes`.
+fn next_upload_chunk(py: Python<'_>, iterator: &Py<PyAny>) -> PyResult<Option<Bytes>> {
+    let iterator = iterator.bind(py);
+    loop {
+        match iterator.call_method0(intern!(py, "__next__")) {
+            Ok(item) => {
+                let data: PyBackedBytes = item.extract()?;
+                if !data.is_empty() {
+                    return Ok(Some(Bytes::copy_from_slice(&data)));
+                }
+            }
+            Err(err) if err.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+                return Ok(None)
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Pull chunks from a Python iterator into the body channel. Runs inside
+/// `block_on` on the thread that called `send()`, so the iterator is consumed
+/// on the caller's own thread, one chunk at a time, as the connection makes
+/// room for it.
+async fn feed_upload(
+    sender: tokio::sync::mpsc::Sender<Bytes>,
+    state: Arc<UploadState>,
+    iterator: Py<PyAny>,
+    failure: Arc<Mutex<Option<PyErr>>>,
+) {
+    loop {
+        let Ok(permit) = sender.reserve().await else {
+            return; // the request finished (or failed) without needing the rest
+        };
+        match Python::attach(|py| next_upload_chunk(py, &iterator)) {
+            Ok(Some(chunk)) => permit.send(chunk),
+            Ok(None) => {
+                state.finished.store(true, Ordering::Release);
+                return;
+            }
+            Err(err) => {
+                // Leaving the body unfinished fails the request; the caller
+                // re-raises the iterator's own exception.
+                *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(err);
+                return;
+            }
+        }
+    }
+}
+
+/// Run a request whose body is fed by `feeder`.
+async fn execute_with_upload<F>(
+    prepared: Prepared,
+    stream: bool,
+    feeder: F,
+) -> NxResult<RawResponse>
+where
+    F: Future<Output = ()>,
+{
+    let ctx = prepared.ctx.clone();
+    let timeouts = prepared.timeouts;
+    let request = execute(prepared, stream);
+    tokio::pin!(request);
+    tokio::pin!(feeder);
+    let mut feeding = true;
+    let response = loop {
+        tokio::select! {
+            result = &mut request => break result?,
+            _ = &mut feeder, if feeding => feeding = false,
+        }
+    };
+    if !(stream && feeding) {
+        // The response is complete (or the body is): nothing left to send.
+        return Ok(response);
+    }
+    // A streaming response arrived while the body is still being sent. The
+    // caller cannot feed it once `send()` returns, so finish the upload here,
+    // still watching for a stalled connection.
+    loop {
+        let deadline = ctx.deadline(&timeouts).map(|(at, _)| at);
+        let sleeper = async {
+            match deadline {
+                Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = &mut feeder => return Ok(response),
+            _ = sleeper => {
+                if let Some((at, kind)) = ctx.deadline(&timeouts) {
+                    if Instant::now() >= at {
+                        return Err(timeout_error(kind, &timeouts));
+                    }
+                }
+            }
+            _ = ctx.notify.notified() => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Raw response handed back to Python
 // ---------------------------------------------------------------------------
 
@@ -587,6 +968,15 @@ pub struct Inner {
     client: reqwest::Client,
     limiter: Option<Arc<Semaphore>>,
     pub ws_tls: Arc<rustls::ClientConfig>,
+    /// The fork generation this engine (its pool and tasks) belongs to.
+    generation: u64,
+}
+
+/// The body of a request being prepared.
+enum RequestBody {
+    Empty,
+    Buffered(PyBackedBytes),
+    Channel(tokio::sync::mpsc::Receiver<Bytes>, Arc<UploadState>),
 }
 
 /// A prepared request, ready to run without the interpreter.
@@ -1022,10 +1412,8 @@ impl ResponseStream {
     /// Awaitable form of `read()`.
     fn aread<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pump = self.pump();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(Outcome(
-                pump.next_chunks(MAX_BYTES_PER_READ).await.map(ChunksOut),
-            ))
+        spawn_awaitable(py, async move {
+            pump.next_chunks(MAX_BYTES_PER_READ).await.map(ChunksOut)
         })
     }
 
@@ -1042,12 +1430,12 @@ impl ResponseStream {
     fn aread_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pump = self.existing_pump();
         let state = self.state.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        spawn_awaitable(py, async move {
             let result = match pump {
                 Some(pump) => pump.read_to_end().await,
                 None => stream_read_all(&state).await,
             };
-            Ok(Outcome(result.map(|chunks| ChunksOut(Some(chunks)))))
+            result.map(|chunks| ChunksOut(Some(chunks)))
         })
     }
 
@@ -1071,12 +1459,10 @@ impl ResponseStream {
     fn aread_events<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pump = self.pump();
         let decoder = self.decoder.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(Outcome(
-                pump.next_chunks(MAX_BYTES_PER_READ)
-                    .await
-                    .map(|chunks| EventsOut { chunks, decoder }),
-            ))
+        spawn_awaitable(py, async move {
+            pump.next_chunks(MAX_BYTES_PER_READ)
+                .await
+                .map(|chunks| EventsOut { chunks, decoder })
         })
     }
 
@@ -1121,8 +1507,11 @@ impl ResponseStream {
 #[pyclass(frozen, module = "nextreq._nextreq", name = "HttpClient")]
 pub struct HttpClient {
     inner: RwLock<Option<Arc<Inner>>>,
+    /// Kept so the engine can be rebuilt in a forked child.
+    options: ClientOptions,
 }
 
+#[derive(Clone)]
 struct ClientOptions {
     tls: TlsOptions,
     proxies: Vec<(String, String)>,
@@ -1139,7 +1528,7 @@ fn config_error(err: impl std::fmt::Display) -> NxError {
     NxError::new(ErrorKind::LocalProtocolError, err.to_string())
 }
 
-fn build_inner(options: ClientOptions) -> NxResult<Inner> {
+fn build_inner(options: &ClientOptions) -> NxResult<Inner> {
     if !options.http1 && !options.http2 && !options.http3 {
         return Err(config_error(
             "at least one of http1, http2 or http3 must be enabled",
@@ -1210,16 +1599,65 @@ fn build_inner(options: ClientOptions) -> NxResult<Inner> {
             .max_connections
             .map(|n| Arc::new(Semaphore::new(n.max(1)))),
         ws_tls,
+        generation: fork_generation(),
     })
 }
 
 impl HttpClient {
     pub fn inner(&self) -> NxResult<Arc<Inner>> {
-        self.inner
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .ok_or_else(|| NxError::new(ErrorKind::ClientClosed, "the client has been closed"))
+        let closed = || NxError::new(ErrorKind::ClientClosed, "the client has been closed");
+        let generation = fork_generation();
+        {
+            let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                None => return Err(closed()),
+                Some(inner) if inner.generation == generation => return Ok(inner.clone()),
+                Some(_) => {}
+            }
+        }
+        // This process was forked after the engine was built. Its pooled
+        // connections are shared with the parent and its background tasks
+        // belong to a runtime that does not exist here, so start afresh.
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            None => return Err(closed()),
+            Some(inner) if inner.generation == generation => return Ok(inner.clone()),
+            Some(_) => {}
+        }
+        let rebuilt = {
+            let _guard = runtime().enter();
+            Arc::new(build_inner(&self.options)?)
+        };
+        if let Some(stale) = guard.replace(rebuilt.clone()) {
+            // Never run its destructors: they would wake tasks on the
+            // parent's runtime, whose locks may be held by threads that do
+            // not exist in this process.
+            std::mem::forget(stale);
+        }
+        Ok(rebuilt)
+    }
+
+    fn ws_options(
+        &self,
+        url: String,
+        headers: Vec<(String, String)>,
+        subprotocols: Option<Vec<String>>,
+        timeout: Option<&Bound<'_, Timeout>>,
+        max_message_size: Option<usize>,
+        compression: bool,
+    ) -> NxResult<crate::ws::ConnectOptions> {
+        let inner = self.inner()?;
+        Ok(crate::ws::ConnectOptions {
+            url,
+            headers,
+            subprotocols: subprotocols.unwrap_or_default(),
+            tls: inner.ws_tls.clone(),
+            proxies: self.options.proxies.clone(),
+            trust_env: self.options.trust_env,
+            connect_timeout: timeout.and_then(|t| t.get().timeouts().connect),
+            max_message_size,
+            compression,
+        })
     }
 
     /// Validate and assemble a request while attached to the interpreter.
@@ -1228,7 +1666,7 @@ impl HttpClient {
         method: &str,
         url: &str,
         headers: &Bound<'_, PyAny>,
-        body: Option<PyBackedBytes>,
+        body: RequestBody,
         timeout: Option<&Bound<'_, Timeout>>,
     ) -> PyResult<NxResult<Prepared>> {
         let inner = match self.inner() {
@@ -1285,23 +1723,36 @@ impl HttpClient {
             Some(t) => t.get().timeouts(),
             None => Timeouts::NONE,
         };
-        let tracked = body
-            .as_ref()
-            .is_some_and(|b| b.len() >= TRACKED_BODY_THRESHOLD);
+        let tracked = match &body {
+            RequestBody::Empty => false,
+            RequestBody::Buffered(data) => data.len() >= TRACKED_BODY_THRESHOLD,
+            RequestBody::Channel(..) => true,
+        };
         let ctx = Arc::new(RequestCtx::new(timeouts.connect, tracked));
 
         let mut request = reqwest::Request::new(method, parsed);
         *request.headers_mut() = header_map;
-        if let Some(body) = body {
-            let data = Bytes::copy_from_slice(&body);
-            *request.body_mut() = Some(if tracked {
-                reqwest::Body::wrap(TrackedBody {
-                    data,
+        match body {
+            RequestBody::Empty => {}
+            RequestBody::Buffered(body) => {
+                let data = Bytes::copy_from_slice(&body);
+                *request.body_mut() = Some(if tracked {
+                    reqwest::Body::wrap(TrackedBody {
+                        data,
+                        ctx: ctx.clone(),
+                    })
+                } else {
+                    reqwest::Body::from(data)
+                });
+            }
+            RequestBody::Channel(chunks, state) => {
+                *request.body_mut() = Some(reqwest::Body::wrap(ChannelBody {
+                    chunks,
+                    state,
                     ctx: ctx.clone(),
-                })
-            } else {
-                reqwest::Body::from(data)
-            });
+                    done: false,
+                }));
+            }
         }
         Ok(Ok(Prepared {
             inner,
@@ -1374,17 +1825,21 @@ impl HttpClient {
             // reqwest's builder may spawn onto the runtime (e.g. the DNS
             // resolver), so build inside the runtime context.
             let _guard = runtime().enter();
-            build_inner(options)
+            build_inner(&options)
         });
         match built {
             Ok(inner) => Ok(HttpClient {
                 inner: RwLock::new(Some(Arc::new(inner))),
+                options,
             }),
             Err(err) => Err(err.into_pyerr(py)),
         }
     }
 
     /// Perform one request, blocking the calling thread (GIL released).
+    ///
+    /// `body` is `bytes`, or an iterator of `bytes` chunks that is consumed
+    /// on the calling thread while the request is sent (a streamed upload).
     ///
     /// Returns `(status, http_version, headers, body, timings)`; `body` is
     /// `bytes`, or a `ResponseStream` when `stream` is true.
@@ -1396,19 +1851,44 @@ impl HttpClient {
         method: &str,
         url: &str,
         headers: &Bound<'py, PyAny>,
-        body: Option<PyBackedBytes>,
+        body: Option<&Bound<'py, PyAny>>,
         timeout: Option<&Bound<'py, Timeout>>,
         stream: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let mut upload = None;
+        let body = match body {
+            None => RequestBody::Empty,
+            Some(body) => match body.extract::<PyBackedBytes>() {
+                Ok(data) => RequestBody::Buffered(data),
+                Err(_) => {
+                    let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_QUEUE_CHUNKS);
+                    let state = Arc::new(UploadState::default());
+                    upload = Some((sender, state.clone(), body.clone().unbind()));
+                    RequestBody::Channel(receiver, state)
+                }
+            },
+        };
         let prepared = match self.prepare(method, url, headers, body, timeout)? {
             Ok(prepared) => prepared,
             Err(err) => return Err(err.into_pyerr(py)),
         };
-        let result = block_on_interruptible(py, execute(prepared, stream))?;
+        let Some((sender, state, iterator)) = upload else {
+            let result = block_on_interruptible(py, execute(prepared, stream))?;
+            return Outcome(result).into_pyobject(py);
+        };
+        let failure = Arc::new(Mutex::new(None));
+        let feeder = feed_upload(sender, state, iterator, failure.clone());
+        let result = block_on_interruptible(py, execute_with_upload(prepared, stream, feeder))?;
+        if let Some(err) = failure.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            return Err(err); // the body iterator raised: that is the real error
+        }
         Outcome(result).into_pyobject(py)
     }
 
     /// Asynchronous form of `send()`.
+    ///
+    /// `body` is `bytes` or an `UploadStream` that Python feeds while the
+    /// request is in flight.
     ///
     /// The request runs on the Tokio runtime and `future` (an
     /// `asyncio.Future` created on the bridge's event loop) is resolved with
@@ -1425,10 +1905,30 @@ impl HttpClient {
         method: &str,
         url: &str,
         headers: &Bound<'py, PyAny>,
-        body: Option<PyBackedBytes>,
+        body: Option<&Bound<'py, PyAny>>,
         timeout: Option<&Bound<'py, Timeout>>,
         stream: bool,
     ) -> PyResult<TaskHandle> {
+        let body = match body {
+            None => RequestBody::Empty,
+            Some(body) => match body.cast::<UploadStream>() {
+                Ok(upload) => {
+                    let upload = upload.get();
+                    let receiver = upload
+                        .receiver
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                        .ok_or_else(|| {
+                            pyo3::exceptions::PyRuntimeError::new_err(
+                                "this UploadStream is already attached to a request",
+                            )
+                        })?;
+                    RequestBody::Channel(receiver, upload.state.clone())
+                }
+                Err(_) => RequestBody::Buffered(body.extract()?),
+            },
+        };
         let prepared = match self.prepare(method, url, headers, body, timeout)? {
             Ok(prepared) => prepared,
             Err(err) => return Err(err.into_pyerr(py)),
@@ -1437,7 +1937,8 @@ impl HttpClient {
     }
 
     /// Open a WebSocket connection (awaitable).
-    #[pyo3(signature = (url, headers, subprotocols = None, timeout = None, max_message_size = None))]
+    #[pyo3(signature = (url, headers, subprotocols = None, timeout = None, max_message_size = None, compression = false))]
+    #[allow(clippy::too_many_arguments)]
     fn ws_connect<'py>(
         &self,
         py: Python<'py>,
@@ -1446,26 +1947,48 @@ impl HttpClient {
         subprotocols: Option<Vec<String>>,
         timeout: Option<&Bound<'py, Timeout>>,
         max_message_size: Option<usize>,
+        compression: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = match self.inner() {
-            Ok(inner) => inner,
+        let options = match self.ws_options(
+            url,
+            headers,
+            subprotocols,
+            timeout,
+            max_message_size,
+            compression,
+        ) {
+            Ok(options) => options,
             Err(err) => return Err(err.into_pyerr(py)),
         };
-        let connect_timeout = timeout.and_then(|t| t.get().timeouts().connect);
-        let tls = inner.ws_tls.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(Outcome(
-                crate::ws::connect(
-                    url,
-                    headers,
-                    subprotocols.unwrap_or_default(),
-                    tls,
-                    connect_timeout,
-                    max_message_size,
-                )
-                .await,
-            ))
-        })
+        spawn_awaitable(py, crate::ws::connect(options))
+    }
+
+    /// Open a WebSocket connection, blocking the calling thread (GIL released).
+    #[pyo3(signature = (url, headers, subprotocols = None, timeout = None, max_message_size = None, compression = false))]
+    #[allow(clippy::too_many_arguments)]
+    fn ws_connect_blocking<'py>(
+        &self,
+        py: Python<'py>,
+        url: String,
+        headers: Vec<(String, String)>,
+        subprotocols: Option<Vec<String>>,
+        timeout: Option<&Bound<'py, Timeout>>,
+        max_message_size: Option<usize>,
+        compression: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = match self.ws_options(
+            url,
+            headers,
+            subprotocols,
+            timeout,
+            max_message_size,
+            compression,
+        ) {
+            Ok(options) => options,
+            Err(err) => return Err(err.into_pyerr(py)),
+        };
+        let result = block_on_interruptible(py, crate::ws::connect(options))?;
+        Outcome(result).into_pyobject(py)
     }
 
     /// Drop the connection pool. In-flight requests finish; new ones fail.
@@ -1480,6 +2003,22 @@ impl HttpClient {
             .unwrap_or_else(|e| e.into_inner())
             .is_none()
     }
+}
+
+/// The request target (`/path?query`) exactly as it is sent on the wire for
+/// `url`, i.e. after the URL parser's percent-encoding. Digest authentication
+/// signs this string, so it has to match byte for byte.
+#[pyfunction]
+pub fn request_target(url: &str) -> PyResult<String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid URL {url:?}: {e}"))
+    })?;
+    let mut target = parsed.path().to_owned();
+    if let Some(query) = parsed.query() {
+        target.push('?');
+        target.push_str(query);
+    }
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -1593,7 +2132,7 @@ mod tests {
             max_keepalive_connections: None,
             keepalive_expiry: None,
         };
-        let err = build_inner(options).err().unwrap();
+        let err = build_inner(&options).err().unwrap();
         assert_eq!(err.kind, ErrorKind::LocalProtocolError);
     }
 }

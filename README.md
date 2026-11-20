@@ -17,7 +17,7 @@ print(r.json(), r.http_version, r.elapsed.total)
 
 - **Fast.** The I/O engine runs in Rust with the GIL released. On the local
   benchmark below it is about 8× `requests` for sequential calls and 2.5× `aiohttp`
-  for async fan-out (3.4× with the built-in `gather()`). [Benchmarks](#benchmarks)
+  for async fan-out (3.3× with the built-in `gather()`). [Benchmarks](#benchmarks)
 - **Sync and async, one API.** `Client` and `AsyncClient` share every option and
   every feature, on one connection pool implementation.
 - **Typed end to end.** `client.get(url, model=User)` returns a `User` - statically
@@ -25,8 +25,10 @@ print(r.json(), r.http_version, r.elapsed.total)
 - **Safe by default.** Timeouts on every phase, TLS verification, bounded
   redirects, credentials dropped on cross-origin redirects.
 - **Resilient.** Built-in retries with exponential backoff, jitter and `Retry-After`.
-- **Realtime.** WHATWG-compliant SSE parser in Rust, WebSockets, and `gather()` for
-  bounded-concurrency fan-out.
+- **Realtime.** WHATWG-compliant SSE parser in Rust, WebSockets (sync and async, with
+  compression and proxy support), and `gather()` for bounded-concurrency fan-out.
+- **Streaming both ways.** Downloads and uploads are streamed: generators and open
+  files are sent chunk by chunk, never loaded into memory.
 - **Testable.** `MockTransport`, plus in-memory transports for ASGI (FastAPI) and
   WSGI (Flask) apps - no sockets, no monkeypatching.
 - **Observable.** Request/response/error hooks, per-phase timings, optional
@@ -35,15 +37,15 @@ print(r.json(), r.http_version, r.elapsed.total)
   zstd decoding, proxies, optional HTTP/3.
 - **Zero mandatory dependencies.** Python 3.10+, one abi3 wheel per platform.
 
-> **Status:** early release (`0.1.x`). The API is small and tested (311 Python tests,
-> 40 Rust tests; the suite also passes on Python 3.10 against the abi3 wheel, and a
-> threaded smoke test passes on free-threaded CPython 3.14t) but young - see
+> **Status:** young but thoroughly tested: 387 Python tests and 45 Rust tests, run
+> on CPython 3.10 (against the abi3 wheel) and 3.14, plus a threaded smoke test on
+> free-threaded CPython 3.14t. What it does not do is listed under
 > [Limitations](#limitations).
 
 ## Installation
 
 ```bash
-pip install nextreq                # once published to PyPI
+pip install nextreq
 pip install "nextreq[pydantic]"    # optional extras: pydantic, msgspec, otel
 ```
 
@@ -66,7 +68,7 @@ import nextreq
 with nextreq.Client(
     base_url="https://api.example.com",
     headers={"Accept": "application/json"},
-    auth=("user", "pass"),            # or nextreq.BearerAuth("token"), or any callable
+    auth=("user", "pass"),            # or BearerAuth / DigestAuth / any callable
     timeout=10,                       # or nextreq.Timeout(connect=2, read=30)
     retries=3,
 ) as client:
@@ -93,6 +95,69 @@ Both clients accept `base_url`, `headers`, `params`, `cookies` (a persistent jar
 `max_connections` and `keepalive_expiry`. Every request method accepts per-request
 overrides. The module-level helpers (`nextreq.get`, `post`, `put`, `patch`, `delete`,
 `head`, `options`, `request`, `stream`) share a keep-alive pool but never share cookies.
+
+### Uploads
+
+Bodies that already sit in memory (`bytes`, `str`, `json=`, form `data=`) are sent
+as they are. Bodies that are *produced* - generators, async generators and open
+files - are streamed: nextreq pulls the next chunk only when the connection is
+ready for it, so memory use stays flat however large the upload is.
+
+```python
+with open("backup.tar", "rb") as f:
+    client.put("/backups/today", content=f)             # sent in 64 KiB pieces, with Content-Length
+
+with open("report.pdf", "rb") as f:                     # multipart: fields in memory, file streamed
+    client.post("/upload", data={"title": "Q3"}, files={"file": f})
+
+def rows():
+    for row in database.iter_rows():
+        yield row.to_json().encode() + b"\n"
+
+client.post("/import", content=rows())                  # unknown length: chunked encoding
+
+async def events():
+    async for event in queue:
+        yield event
+
+await aclient.post("/ingest", content=events())         # async generators work with AsyncClient
+```
+
+A retry or a `307`/`308` redirect has to send the body again. Seekable files and
+re-iterable objects are rewound and replayed; a one-shot generator cannot be, so such
+a request is not retried, and a redirect that needs the body raises `StreamConsumed`.
+
+### Authentication
+
+```python
+client = nextreq.Client(auth=("user", "pass"))                  # Basic
+client = nextreq.Client(auth=nextreq.BearerAuth("token"))
+client = nextreq.Client(auth=nextreq.DigestAuth("user", "pass"))
+client.get("/private", auth=sign_request)                       # any callable taking the request
+```
+
+`DigestAuth` implements RFC 7616 (MD5, SHA-256, SHA-512 and their `-sess` variants,
+`qop=auth`). It answers the server's challenge transparently and remembers it, so
+only the first request costs a round trip.
+
+Schemes that depend on the server's answer subclass `Auth` and write an `auth_flow`
+generator: it yields a request and receives the response to it, as often as it needs
+to. The same flow drives both clients.
+
+```python
+class RefreshingAuth(nextreq.Auth):
+    def auth_flow(self, request):
+        request.headers["authorization"] = f"Bearer {self.token}"
+        response = yield request
+        if response.status_code == 401:
+            refreshed = yield nextreq.Request("POST", "https://auth.example.com/token", json=...)
+            self.token = refreshed.json()["access_token"]
+            request.headers["authorization"] = f"Bearer {self.token}"
+            yield request
+```
+
+Flow-based credentials follow redirects within the same origin and are dropped when
+a redirect leaves it, like the `Authorization` header.
 
 ### Typed responses
 
@@ -171,11 +236,22 @@ async with aclient.websocket("wss://example.com/ws", subprotocols=["json"]) as w
     await ws.send_json({"subscribe": "ticker"})
     async for message in ws:                 # str or bytes; stops when the peer closes
         ...
+
+with client.websocket("wss://example.com/ws", compression=True) as ws:   # blocking API
+    ws.send_text("hello")
+    print(ws.receive(timeout=5), ws.compressed)
 ```
 
 `send_text` / `send_bytes` / `send_json`, `receive` / `receive_text` / `receive_bytes` /
 `receive_json` (optionally with `timeout=`), `ping` and `close(code, reason)` are
-available; a closed connection raises `WebSocketDisconnect(code, reason)`.
+available on both; a closed connection raises `WebSocketDisconnect(code, reason)`.
+With the blocking API one thread can wait in `receive()` while another sends.
+
+Connections use the client's TLS settings, default headers, cookies and proxies
+(`http://` proxies via `CONNECT`, `socks5://`, and the proxy environment variables
+including `NO_PROXY`). `compression=True` offers permessage-deflate (RFC 7692);
+`ws.compressed` tells you whether the server accepted it. Pings from the server are
+answered automatically.
 
 ### Concurrency: `gather()`
 
@@ -215,9 +291,19 @@ Call your own application in-process, through the real client pipeline:
 async with nextreq.AsyncClient(app=fastapi_app) as client:    # ASGI 3.0
     assert (await client.get("/health")).status_code == 200
 
+    async with client.stream("GET", "/events") as response:  # streamed as the app sends it
+        async for event in response.aiter_sse():
+            ...
+
 with nextreq.Client(app=flask_app) as client:                 # WSGI
     assert client.get("/health").json() == {"ok": True}
 ```
+
+Responses from the application are streamed with backpressure, so streaming and SSE
+endpoints can be tested chunk by chunk, and closing a response early is seen by the
+application as a client disconnect. ASGI lifespan events run too: startup before the
+first request, shutdown when the client is closed (`ASGITransport(app, lifespan=False)`
+turns that off), and lifespan state is available to the handlers.
 
 ### Hooks, timings and OpenTelemetry
 
@@ -262,62 +348,62 @@ overhead (no internet jitter). Everything here is produced by
 data are in [`benches/RESULTS.md`](benches/RESULTS.md).
 
 <!-- BENCHMARKS:START -->
-_Apple M2 Max · CPython 3.14.6 · nextreq 0.1.0 vs requests 2.34.2, httpx 0.28.1, aiohttp 3.14.5 · 2026-11-20 04:19 UTC. "nextreq speedup" is nextreq's throughput divided by that library's._
+_Apple M2 Max · CPython 3.14.6 · nextreq 0.1.1 vs requests 2.34.2, httpx 0.28.1, aiohttp 3.14.5 · 2026-11-20 23:02 UTC. "nextreq speedup" is nextreq's throughput divided by that library's._
 
 **1. Sequential sync GETs** - 500 GET requests for a small JSON document, one after another, over a single keep-alive connection.
 
 | Library | Requests/sec | nextreq speedup | p50 (ms) | p95 (ms) | p99 (ms) | Peak RSS (MB) |
 |---|---:|---:|---:|---:|---:|---:|
-| **nextreq** | 22,100 | baseline | 0.044 | 0.055 | 0.090 | 40.3 |
-| aiohttp (awaited sequentially) | 12,487 | 1.77× | 0.079 | 0.088 | 0.096 | 53.8 |
-| httpx | 4,900 | 4.51× | 0.200 | 0.229 | 0.420 | 67.1 |
-| requests | 2,682 | 8.24× | 0.369 | 0.405 | 0.441 | 49.2 |
+| **nextreq** | 22,016 | baseline | 0.044 | 0.056 | 0.065 | 43.5 |
+| aiohttp (awaited sequentially) | 12,519 | 1.76× | 0.078 | 0.089 | 0.097 | 52.4 |
+| httpx | 5,081 | 4.33× | 0.194 | 0.215 | 0.418 | 67.5 |
+| requests | 2,688 | 8.19× | 0.362 | 0.416 | 0.481 | 49.3 |
 
 **2. High-concurrency async fan-out** - 1000 GET requests with at most 50 in flight.
 
 | Library | Requests/sec | nextreq speedup | p50 (ms) | p95 (ms) | p99 (ms) | Peak RSS (MB) |
 |---|---:|---:|---:|---:|---:|---:|
-| **nextreq (client.gather)** | 80,106 | — | 0.258 | 0.429 | 0.536 | 46.8 |
-| **nextreq (asyncio.gather + Semaphore)** | 60,253 | baseline | 0.506 | 0.827 | 1.42 | 46.5 |
-| aiohttp | 23,663 | 2.55× | 1.25 | 1.94 | 2.25 | 55.9 |
-| requests (thread pool) | 3,242 | 18.58× | 14.0 | 25.7 | 33.0 | 53.7 |
-| httpx | 599 | 100.53× | 56.0 | 227 | 328 | 71.6 |
+| **nextreq (client.gather)** | 79,389 | — | 0.229 | 0.388 | 0.431 | 50.2 |
+| **nextreq (asyncio.gather + Semaphore)** | 61,095 | baseline | 0.500 | 0.937 | 1.24 | 49.4 |
+| aiohttp | 23,978 | 2.55× | 1.24 | 1.93 | 2.25 | 54.6 |
+| requests (thread pool) | 3,216 | 18.99× | 14.0 | 28.7 | 35.5 | 54.0 |
+| httpx | 602 | 101.49× | 56.2 | 226 | 330 | 73.6 |
 
 **3. Typed JSON deserialization** - 500 GET requests for a ~1.3 kB JSON document, each validated into a Pydantic v2 model (nested models, a list of 10 sub-objects, a datetime).
 
 | Library | Requests/sec | nextreq speedup | p50 (ms) | p95 (ms) | p99 (ms) | Peak RSS (MB) |
 |---|---:|---:|---:|---:|---:|---:|
-| **nextreq** | 16,683 | baseline | 0.058 | 0.071 | 0.078 | 54.2 |
-| aiohttp (awaited sequentially) | 8,387 | 1.99× | 0.114 | 0.154 | 0.197 | 64.2 |
-| httpx | 3,414 | 4.89× | 0.268 | 0.422 | 0.667 | 77.5 |
-| requests | 2,528 | 6.60× | 0.393 | 0.416 | 0.433 | 60.4 |
+| **nextreq** | 16,686 | baseline | 0.058 | 0.069 | 0.076 | 54.6 |
+| aiohttp (awaited sequentially) | 9,511 | 1.75× | 0.105 | 0.116 | 0.125 | 62.6 |
+| httpx | 3,920 | 4.26× | 0.252 | 0.275 | 0.445 | 76.0 |
+| requests | 2,509 | 6.65× | 0.395 | 0.427 | 0.457 | 61.4 |
 
 **4. SSE streaming throughput** - A stream of 10000 Server-Sent Events, consumed into event objects (event, data, id, retry).
 
 | Library | Events/sec | nextreq speedup | Time per stream (ms) | Peak RSS (MB) |
 |---|---:|---:|---:|---:|
-| **nextreq** | 2,829,154 | baseline | 3.53 | 41.7 |
-| requests + hand-written parser | 846,400 | 3.34× | 11.8 | 49.7 |
-| httpx + hand-written parser | 784,547 | 3.61× | 12.7 | 68.5 |
-| aiohttp + hand-written parser | 195,832 | 14.45× | 51.1 | 54.0 |
+| **nextreq** | 2,986,561 | baseline | 3.35 | 44.8 |
+| requests + hand-written parser | 882,408 | 3.38× | 11.3 | 49.0 |
+| httpx + hand-written parser | 821,055 | 3.64× | 12.2 | 68.1 |
+| aiohttp + hand-written parser | 192,447 | 15.52× | 52.0 | 52.8 |
 
 **5. Large payload downloads (bonus)** - 100 sequential GET requests, each downloading a 1 MiB body.
 
 | Library | Requests/sec | nextreq speedup | p50 (ms) | p95 (ms) | p99 (ms) | Peak RSS (MB) |
 |---|---:|---:|---:|---:|---:|---:|
-| **nextreq** | 5,426 | baseline | 0.180 | 0.233 | 0.264 | 46.8 |
-| aiohttp (awaited sequentially) | 4,736 | 1.15× | 0.210 | 0.223 | 0.247 | 57.0 |
-| httpx | 1,618 | 3.35× | 0.614 | 0.670 | 0.999 | 141.4 |
-| requests | 1,208 | 4.49× | 0.819 | 0.894 | 1.03 | 53.0 |
+| **nextreq** | 5,356 | baseline | 0.178 | 0.243 | 0.347 | 50.9 |
+| aiohttp (awaited sequentially) | 4,664 | 1.15× | 0.212 | 0.238 | 0.255 | 57.4 |
+| httpx | 1,688 | 3.17× | 0.591 | 0.634 | 0.907 | 141.4 |
+| requests | 1,244 | 4.31× | 0.794 | 0.874 | 1.10 | 52.2 |
 
 **Takeaways**
 
-- **Sequential sync GETs:** nextreq handles 22,100 req/s at a p50 of 0.044 ms - **8.2×** requests, **4.5×** httpx, **1.8×** aiohttp.
-- **Async fan-out:** with the same `asyncio.gather` + `Semaphore` harness nextreq reaches 60,253 req/s - **2.5×** aiohttp, **100.5×** httpx, **18.6×** requests. The built-in `client.gather()` reaches 80,106 req/s (1.33× the asyncio.gather harness, 3.4× aiohttp).
-- **Typed JSON:** `client.get(url, model=User)` (bytes validated straight into the model by pydantic-core) is **6.6×** requests, **4.9×** httpx, **2.0×** aiohttp doing `User.model_validate(response.json())`.
-- **SSE:** the Rust parser delivers 2,829,154 events/s as ready-made `SSEEvent` objects - **3.3×** requests, **3.6×** httpx, **14.4×** aiohttp with a hand-written Python parser.
-- **Large downloads:** for 1 MiB bodies, where memory copies rather than per-request overhead dominate, nextreq is **4.5×** requests, **3.4×** httpx, **1.1×** aiohttp.
-- **Memory:** nextreq's peak RSS stays between 40 and 54 MB across scenarios (interpreter included); see each table for the per-library comparison.
+- **Sequential sync GETs:** nextreq handles 22,016 req/s at a p50 of 0.044 ms - **8.2×** requests, **4.3×** httpx, **1.8×** aiohttp.
+- **Async fan-out:** with the same `asyncio.gather` + `Semaphore` harness nextreq reaches 61,095 req/s - **2.5×** aiohttp, **101.5×** httpx, **19.0×** requests. The built-in `client.gather()` reaches 79,389 req/s (1.30× the asyncio.gather harness, 3.3× aiohttp).
+- **Typed JSON:** `client.get(url, model=User)` (bytes validated straight into the model by pydantic-core) is **6.7×** requests, **4.3×** httpx, **1.8×** aiohttp doing `User.model_validate(response.json())`.
+- **SSE:** the Rust parser delivers 2,986,561 events/s as ready-made `SSEEvent` objects - **3.4×** requests, **3.6×** httpx, **15.5×** aiohttp with a hand-written Python parser.
+- **Large downloads:** for 1 MiB bodies, where memory copies rather than per-request overhead dominate, nextreq is **4.3×** requests, **3.2×** httpx, **1.1×** aiohttp.
+- **Memory:** nextreq's peak RSS stays between 44 and 55 MB across scenarios (interpreter included); see each table for the per-library comparison.
 <!-- BENCHMARKS:END -->
 
 Reproduce with `maturin develop --release && python benches/run_benchmarks.py`.
@@ -337,7 +423,7 @@ dominates and the gaps narrow. What stays is the lower CPU cost per request.
 | Typed responses (`model=`) | ✅ | — | — | — |
 | Fully typed API + stubs | ✅ | third-party stubs | ✅ | ✅ |
 | Server-Sent Events | ✅ built in | — | extra package | extra package |
-| WebSockets | ✅ async | — | extra package | ✅ |
+| WebSockets | ✅ sync + async | — | extra package | ✅ async |
 | Bounded-concurrency `gather()` | ✅ | — | — | — |
 | Mock transport built in | ✅ | extra package | ✅ basic | extra package |
 | In-process ASGI / WSGI | ✅ / ✅ | — | ✅ / ✅ | — |
@@ -423,43 +509,53 @@ with ThreadPoolExecutor(max_workers=20) as pool:
    │ _nextreq (PyO3)                                           │  bytes on the wire,
    │   HttpClient      reqwest + hyper (HTTP/1.1, HTTP/2)      │  GIL released
    │   Timeout / RetryPolicy / TLS (rustls, native + webpki)   │
-   │   SSEParser · SSEEvent · WebSocket (tokio-tungstenite)    │
+   │   SSEParser · SSEEvent · WebSocket (yawc, deflate)        │
    │   shared multi-threaded Tokio runtime                     │
    └──────────────────────────────────────────────────────────┘
 ```
 
 - **Sync calls** park the calling thread in `Runtime::block_on` with the interpreter
   detached, waking every 100 ms only to let Python deliver signals (Ctrl-C works).
-- **Async calls** run on the Tokio runtime. Finished requests are queued without
-  touching the interpreter and delivered to asyncio in batches by a single
-  `call_soon_threadsafe`, so I/O threads never fight the event loop for the GIL.
-  WebSockets and stream reads use `pyo3-async-runtimes`.
+- **Async calls** run on the Tokio runtime. Finished requests, stream reads and
+  WebSocket operations are queued without touching the interpreter and delivered to
+  asyncio in batches by a single `call_soon_threadsafe`, so I/O threads never fight
+  the event loop for the GIL.
+- **Uploads** flow through a small bounded queue: the sync client pulls the next
+  chunk from your iterator on the calling thread, the async client from the event
+  loop, and only when the connection has taken the previous ones.
 - **Timeouts** are enforced per request in Rust: pool (semaphore), connect (a
   connector layer covering DNS + TCP + TLS), write (upload progress) and read
   (headers, then each body chunk).
 - **Free-threading:** the extension declares itself safe without the GIL; every
   exposed class is frozen and guards its state with Rust synchronisation. Wheels
   target abi3 (CPython 3.10+) and, from 3.15, abi3t (PEP 803).
+- **Forking:** the runtime's threads do not survive `os.fork()`, so nextreq starts a
+  new runtime and new connection pools in the child. Clients created before the fork
+  (gunicorn `--preload`, `multiprocessing`) keep working there.
 
 ## Limitations
 
-Known gaps in the `0.1` series, in rough priority order:
+Known gaps, in rough priority order:
 
-- **Uploads are buffered.** `content=` accepts an iterable of bytes but joins it in
-  memory first; multipart bodies are built in memory too.
-- **WebSockets are async-only**, do not go through proxies, and do not negotiate
-  `permessage-deflate`.
-- **ASGI / WSGI transports buffer the response** and do not run ASGI lifespan events.
-- **No Digest/NTLM auth and no auth flows** that need to see a response (use an
-  `on_response` hook or a custom `auth` callable).
-- **`max_connections` bounds in-flight requests**, not sockets: during a burst the
-  pool can briefly open one extra connection per waiting request.
-- **The cookie jar does not use the Public Suffix List.**
 - **HTTP/3 is opt-in** and requires a custom build
   (`RUSTFLAGS="--cfg reqwest_unstable" maturin build --features http3`), because the
-  underlying support is still marked unstable upstream.
-- **`fork()`**: like any library with background threads, create clients after
-  forking, not before.
+  underlying support is still marked unstable upstream. The published wheels do not
+  include it, and it is only compile-checked here, not tested against a server.
+- **No NTLM, Negotiate or Kerberos auth.** Digest supports `qop=auth` but not
+  `auth-int`. Write an `auth_flow` for anything else.
+- **`max_connections` counts connections in use**, not idle ones. With one host the
+  socket count stays at the limit; idle keep-alive connections to *other* hosts come
+  on top until they expire (`keepalive_expiry`, `max_keepalive_connections`).
+- **WebSockets** cannot go through an `https://` proxy (TLS to the proxy itself), and
+  flow-based auth such as `DigestAuth` is not applied to the handshake.
+- **`AsyncClient` reads upload files on the event loop**, 64 KiB at a time. For slow
+  disks or network file systems, feed the upload from an async generator instead.
+- **In-process transports** (`MockTransport`, ASGI, WSGI) receive a streamed request
+  body in one piece, and a WSGI application called from `AsyncClient` is buffered.
+- **After `fork()`**, responses and WebSockets that were open in the parent cannot be
+  used in the child, and forking while another thread is in the middle of a request
+  is not supported (CPython itself warns about forking a multi-threaded process).
+- **The Public Suffix List is compiled in**, so it is as fresh as the release.
 
 ## Development
 

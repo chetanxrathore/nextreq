@@ -6,6 +6,7 @@ import asyncio
 import copy
 import json
 import pickle
+import threading
 import time
 
 import pytest
@@ -14,7 +15,7 @@ import nextreq
 from nextreq import Response, SSEEvent
 from nextreq._nextreq import SSEParser
 
-from .conftest import SSE_FIXTURES, LiveServer, TLSServer
+from .conftest import SSE_FIXTURES, LiveServer, ProxyServer, TLSServer
 
 MIXED_EVENTS = [
     SSEEvent(event="message", data="first", id=None, retry=None),
@@ -379,3 +380,232 @@ async def test_websocket_tls_handshake_uses_client_tls_settings(tls_server: TLSS
     async with nextreq.AsyncClient(verify=tls_server.ca_path) as trusting:
         with pytest.raises(nextreq.WebSocketError, match="HTTP"):
             await trusting.websocket(f"wss://localhost:{tls_server.port}/ws")
+
+
+# -- WebSockets: compression, keep-alive, proxies ------------------------------
+
+
+async def test_websocket_compression_is_opt_in(aclient: nextreq.AsyncClient) -> None:
+    async with aclient.websocket("/ws") as ws:
+        assert ws.compressed is False
+        assert "sec-websocket-extensions" not in ws.response_headers
+        await ws.send_text("compressed?")
+        assert await ws.receive() == "compressed:False"
+
+
+async def test_websocket_permessage_deflate_roundtrip(aclient: nextreq.AsyncClient) -> None:
+    async with aclient.websocket("/ws", compression=True) as ws:
+        assert ws.compressed is True
+        assert "permessage-deflate" in ws.response_headers["sec-websocket-extensions"]
+        await ws.send_text("compressed?")
+        assert await ws.receive() == "compressed:True"
+
+        # Highly compressible, then incompressible, then tiny: every message
+        # must survive compression on the way out and decompression on the way in.
+        repetitive = "nextreq " * 20_000
+        await ws.send_text(repetitive)
+        assert await ws.receive() == "echo:" + repetitive
+
+        noisy = bytes((i * 7919) % 256 for i in range(200_000))
+        await ws.send_bytes(noisy)
+        assert await ws.receive() == noisy
+
+        for n in range(20):  # the shared compression context carries over
+            await ws.send_text(f"msg-{n}")
+            assert await ws.receive() == f"echo:msg-{n}"
+
+
+async def test_websocket_answers_server_pings(aclient: nextreq.AsyncClient) -> None:
+    """The server drops the connection unless its pings are answered while idle."""
+    async with aclient.websocket("/ws-heartbeat") as ws:
+        await asyncio.sleep(0.7)  # several ping intervals with no application traffic
+        await ws.send_text("still here")
+        assert await ws.receive(timeout=5) == "echo:still here"
+
+
+async def test_websocket_ping_payload_limit(aclient: nextreq.AsyncClient) -> None:
+    async with aclient.websocket("/ws") as ws:
+        await ws.ping(b"x" * 125)
+        with pytest.raises(nextreq.LocalProtocolError, match="125 bytes"):
+            await ws.ping(b"x" * 126)
+
+
+async def test_websocket_max_message_size(aclient: nextreq.AsyncClient) -> None:
+    async with aclient.websocket("/ws", max_message_size=1024) as ws:
+        await ws.send_bytes(b"x" * 512)
+        assert await ws.receive() == b"x" * 512
+        await ws.send_bytes(b"x" * 4096)
+        with pytest.raises(nextreq.WebSocketError):
+            await ws.receive(timeout=5)
+
+
+async def test_websocket_through_an_http_proxy(server: LiveServer, proxy: ProxyServer) -> None:
+    async with nextreq.AsyncClient(proxy=proxy.url, trust_env=False) as client:
+        async with client.websocket(f"{server.ws_url}/ws") as ws:
+            await ws.send_text("tunnelled")
+            assert await ws.receive() == "echo:tunnelled"
+    assert proxy.requests == [f"CONNECT 127.0.0.1:{server.port}"]
+
+
+async def test_websocket_proxy_credentials(server: LiveServer, proxy: ProxyServer) -> None:
+    proxy_url = f"http://user%40corp:p%3Ass@127.0.0.1:{proxy.port}"
+    async with nextreq.AsyncClient(proxy=proxy_url, trust_env=False) as client:
+        async with client.websocket(f"{server.ws_url}/ws") as ws:
+            await ws.send_text("auth")
+            assert await ws.receive() == "echo:auth"
+    # base64("user@corp:p:ss")
+    assert proxy.last_headers["proxy-authorization"] == "Basic dXNlckBjb3JwOnA6c3M="
+
+
+async def test_websocket_proxy_from_environment(
+    server: LiveServer, proxy: ProxyServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+    monkeypatch.setenv("HTTP_PROXY", proxy.url)
+    async with nextreq.AsyncClient() as client:
+        async with client.websocket(f"{server.ws_url}/ws") as ws:
+            await ws.send_text("env")
+            assert await ws.receive() == "echo:env"
+        assert len(proxy.requests) == 1
+
+        # NO_PROXY exempts the host: the next connection goes direct.
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        async with client.websocket(f"{server.ws_url}/ws") as ws:
+            await ws.send_text("direct")
+            assert await ws.receive() == "echo:direct"
+        assert len(proxy.requests) == 1
+
+
+async def test_websocket_proxy_refusal_is_a_proxy_error(server: LiveServer) -> None:
+    # A plain HTTP server standing in for the proxy answers CONNECT with an error.
+    async with nextreq.AsyncClient(proxy=server.url, trust_env=False) as client:
+        with pytest.raises(nextreq.ProxyError, match="refused the tunnel"):
+            async with client.websocket("ws://example.invalid/ws"):
+                pass
+
+
+async def test_websocket_over_tls(tls_server: TLSServer) -> None:
+    async with nextreq.AsyncClient(verify=tls_server.ca_path) as client:
+        async with client.websocket(f"wss://localhost:{tls_server.port}/ws-echo") as ws:
+            await ws.send_text("secure")
+            assert await ws.receive() == "tls:secure"
+            await ws.send_bytes(b"\x00\xff" * 1000)
+            assert await ws.receive() == b"\x00\xff" * 1000
+
+
+# -- WebSockets: the blocking API ------------------------------------------------
+
+
+def test_sync_websocket_text_bytes_and_json(client: nextreq.Client) -> None:
+    with client.websocket("/ws") as ws:
+        assert isinstance(ws, nextreq.SyncWebSocket)
+        assert not ws.closed
+        ws.send_text("hello")
+        assert ws.receive() == "echo:hello"
+
+        ws.send(b"raw")
+        assert ws.receive_bytes() == b"raw"
+
+        ws.send_json({"n": 1, "name": "Zoë"})
+        assert json.loads(ws.receive_text().removeprefix("echo:")) == {"n": 1, "name": "Zoë"}
+
+        ws.send_json([1, 2, 3], mode="binary")
+        assert ws.receive_json() == [1, 2, 3]
+
+        ws.ping(b"p")
+    assert ws.closed and ws.close_code == 1000
+    ws.close()  # safe to repeat
+    with pytest.raises(nextreq.WebSocketDisconnect):
+        ws.receive()
+    with pytest.raises(nextreq.WebSocketError):
+        ws.send_text("after close")
+
+
+def test_sync_websocket_server_initiated_close_and_iteration(client: nextreq.Client) -> None:
+    with client.websocket("/ws-close") as ws:
+        assert list(ws) == ["one", "two"]
+        assert ws.closed
+        assert (ws.close_code, ws.close_reason) == (1001, "going away")
+
+    with client.websocket("/ws") as ws:
+        ws.send_text("close-me")
+        with pytest.raises(nextreq.WebSocketDisconnect) as excinfo:
+            ws.receive()
+        assert excinfo.value.code == 4001
+        assert excinfo.value.reason == "server says bye"
+
+
+def test_sync_websocket_receive_timeout(client: nextreq.Client) -> None:
+    with client.websocket("/ws") as ws:
+        started = time.perf_counter()
+        with pytest.raises(nextreq.ReadTimeout, match="waiting for a WebSocket message"):
+            ws.receive(timeout=0.2)
+        assert 0.15 < time.perf_counter() - started < 2.0
+        # The connection is still usable after a timeout.
+        ws.send_text("again")
+        assert ws.receive(timeout=5) == "echo:again"
+
+
+def test_sync_websocket_subprotocol_headers_and_compression(
+    client: nextreq.Client, server: LiveServer
+) -> None:
+    with client.websocket("/ws", subprotocols=["json", "chat"], compression=True) as ws:
+        assert ws.subprotocol in ("chat", "json")
+        assert ws.compressed is True
+        payload = "abc" * 50_000
+        ws.send_text(payload)
+        assert ws.receive() == "echo:" + payload
+
+    with nextreq.Client(base_url=server.url, headers={"X-Client": "sync"}) as other:
+        other.cookies["session"] = "abc"
+        with other.websocket("/ws-headers", auth=("user", "pass")) as ws:
+            seen = ws.receive_json()
+    assert seen["x-client"] == "sync"
+    assert seen["cookie"] == "session=abc"
+    assert seen["authorization"].startswith("Basic ")
+
+
+def test_sync_websocket_one_thread_receives_while_another_sends(client: nextreq.Client) -> None:
+    with client.websocket("/ws") as ws:
+        received: list[str | bytes] = []
+
+        def reader() -> None:
+            received.extend(ws.receive(timeout=10) for _ in range(20))
+
+        thread = threading.Thread(target=reader)
+        thread.start()
+        time.sleep(0.05)  # let the reader block in receive()
+        for n in range(20):
+            ws.send_text(str(n))
+        thread.join(10)
+        assert not thread.is_alive()
+    assert received == [f"echo:{n}" for n in range(20)]
+
+
+def test_sync_websocket_through_a_proxy(server: LiveServer, proxy: ProxyServer) -> None:
+    with nextreq.Client(proxy=proxy.url, trust_env=False) as client:
+        with client.websocket(f"{server.ws_url}/ws") as ws:
+            ws.send_text("sync tunnel")
+            assert ws.receive() == "echo:sync tunnel"
+    assert proxy.requests == [f"CONNECT 127.0.0.1:{server.port}"]
+
+
+def test_sync_websocket_over_tls_through_a_proxy(tls_server: TLSServer, proxy: ProxyServer) -> None:
+    """wss:// through a proxy: CONNECT first, then TLS to the origin inside the tunnel."""
+    with nextreq.Client(verify=tls_server.ca_path, proxy=proxy.url, trust_env=False) as client:
+        with client.websocket(f"wss://localhost:{tls_server.port}/ws-echo") as ws:
+            ws.send_text("secure tunnel")
+            assert ws.receive() == "tls:secure tunnel"
+    assert proxy.requests == [f"CONNECT localhost:{tls_server.port}"]
+
+
+def test_sync_websocket_errors(client: nextreq.Client, unused_port: int) -> None:
+    with pytest.raises(nextreq.WebSocketError, match="HTTP 404"):
+        client.websocket("/no-such-endpoint")
+    with pytest.raises(nextreq.ConnectError):
+        client.websocket(f"ws://127.0.0.1:{unused_port}/ws")
+    with nextreq.Client(transport=nextreq.MockTransport()) as mocked:
+        with pytest.raises(nextreq.WebSocketError, match="custom transport"):
+            mocked.websocket("ws://example.com/ws")

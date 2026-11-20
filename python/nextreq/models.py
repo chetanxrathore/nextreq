@@ -6,10 +6,12 @@ import codecs
 import dataclasses
 import datetime
 import enum
+import io
 import json as _json
 import mimetypes
 import os
 import re
+import stat
 import time
 from collections.abc import (
     AsyncIterable,
@@ -25,7 +27,7 @@ from http import HTTPStatus
 from typing import IO, TYPE_CHECKING, Any, Final, TypeVar, Union, overload
 from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 
-from ._nextreq import ResponseStream, SSEEvent, SSEParser, Timeout
+from ._nextreq import ResponseStream, SSEEvent, SSEParser, Timeout, is_public_suffix
 from .exceptions import (
     HTTPStatusError,
     InvalidURL,
@@ -44,6 +46,7 @@ __all__ = [
     "Elapsed",
     "Headers",
     "Request",
+    "RequestStream",
     "Response",
     "SSEEvent",
 ]
@@ -81,7 +84,9 @@ QueryParamTypes = Union[
 ]
 CookieTypes = Union["Cookies", Mapping[str, str], Sequence[tuple[str, str]]]
 TimeoutTypes = Union[float, int, Timeout, None]
-RequestContent = Union[str, bytes, bytearray, memoryview, Iterable[bytes]]
+RequestContent = Union[
+    str, bytes, bytearray, memoryview, IO[bytes], Iterable[bytes], AsyncIterable[bytes]
+]
 RequestData = Union[Mapping[str, Any], Sequence[tuple[str, Any]], str, bytes]
 FileContent = Union[IO[bytes], bytes, str]
 FileTypes = Union[
@@ -550,10 +555,15 @@ class Cookies(MutableMapping[str, str]):
                 # A server may only set cookies for its own domain or a parent.
                 if host != domain_attr and not host.endswith("." + domain_attr):
                     continue
-                # Refuse dotless "domains" (e.g. "com") unless it is the host itself.
-                if "." not in domain_attr and host != domain_attr:
-                    continue
-                domain, host_only = domain_attr, False
+                if is_public_suffix(domain_attr):
+                    # A cookie for a whole public suffix ("com", "co.uk",
+                    # "github.io") would be sent to unrelated sites. It is only
+                    # acceptable from that very host, as a host-only cookie.
+                    if host != domain_attr:
+                        continue
+                    domain, host_only = host, True
+                else:
+                    domain, host_only = domain_attr, False
             else:
                 domain, host_only = host, True
             path = attrs.get("path", "")
@@ -670,7 +680,177 @@ def json_dumps(obj: Any) -> bytes:
     ).encode("utf-8")
 
 
-def _file_part(name: str, value: FileTypes) -> tuple[dict[str, str], bytes]:
+#: Size of the pieces a file is read in while it is uploaded.
+UPLOAD_CHUNK_SIZE: Final = 64 * 1024
+
+
+def _as_upload_file(obj: Any) -> Any | None:
+    """``obj`` if it is a binary file backed by a file descriptor, else ``None``.
+
+    Only those are streamed. In-memory files (``io.BytesIO``) are already in
+    memory, and text-mode files have no byte length, so both are read up front.
+    """
+    if not callable(getattr(obj, "read", None)) or isinstance(obj, io.TextIOBase):
+        return None
+    try:
+        obj.fileno()
+    except (AttributeError, OSError, ValueError):
+        return None
+    return obj
+
+
+def _remaining_size(file: Any) -> int | None:
+    """Bytes between the file's current position and its end, if knowable."""
+    try:
+        info = os.fstat(file.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        return max(info.st_size - int(file.tell()), 0)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+class _FilePart:
+    """A file (from its current position) inside a streamed body."""
+
+    __slots__ = ("file", "length", "start")
+
+    def __init__(self, file: Any) -> None:
+        self.file = file
+        self.length = _remaining_size(file)
+        try:
+            self.start: int | None = file.tell() if file.seekable() else None
+        except (AttributeError, OSError, ValueError):
+            self.start = None
+
+    def chunks(self, rewind: bool) -> Iterator[bytes]:
+        file = self.file
+        if rewind:
+            file.seek(self.start)
+        remaining = self.length
+        while remaining is None or remaining > 0:
+            size = UPLOAD_CHUNK_SIZE if remaining is None else min(UPLOAD_CHUNK_SIZE, remaining)
+            chunk = file.read(size)
+            if not chunk:
+                break
+            if remaining is not None:
+                remaining -= len(chunk)
+            yield chunk
+
+
+def _checked_chunk(chunk: Any) -> bytes:
+    if isinstance(chunk, bytes):
+        return chunk
+    if isinstance(chunk, (bytearray, memoryview)):
+        return bytes(chunk)
+    raise TypeError(
+        f"request body chunks must be bytes, not {type(chunk).__name__} "
+        "(encode text before yielding it)"
+    )
+
+
+class RequestStream:
+    """A request body that is produced while it is being sent.
+
+    Created for ``content=`` generators, async generators and open files, and
+    for ``files=`` uploads of open files. Nothing is read until the request is
+    sent, and then only a few chunks are in memory at a time.
+
+    Attributes:
+        length: the body size in bytes when it is known up front (files),
+            otherwise ``None`` (the body is then sent with chunked encoding).
+    """
+
+    __slots__ = ("_parts", "_source", "_started", "length")
+
+    def __init__(
+        self,
+        source: Any = None,
+        *,
+        parts: list[bytes | _FilePart] | None = None,
+    ) -> None:
+        self._source = source
+        self._parts = parts
+        self._started = False
+        self.length: int | None = None
+        if parts is not None:
+            sizes = [len(p) if isinstance(p, bytes) else p.length for p in parts]
+            if all(size is not None for size in sizes):
+                self.length = sum(size for size in sizes if size is not None)
+
+    @property
+    def is_async(self) -> bool:
+        """Whether the body comes from an async iterable (``AsyncClient`` only)."""
+        return self._parts is None and hasattr(self._source, "__aiter__")
+
+    @property
+    def replayable(self) -> bool:
+        """Whether the body can be produced again for a retry or a redirect.
+
+        True for seekable files and re-iterable objects; false for generators
+        and other one-shot iterators.
+        """
+        if self._parts is not None:
+            return all(isinstance(p, bytes) or p.start is not None for p in self._parts)
+        source = self._source
+        return not (hasattr(source, "__next__") or hasattr(source, "__anext__"))
+
+    def _begin(self) -> bool:
+        """Mark the body as started; returns whether this is a replay."""
+        replay = self._started
+        if replay and not self.replayable:
+            raise StreamConsumed(
+                "The request body is a one-shot stream that has already been sent, "
+                "so it cannot be sent again for a retry or a redirect. "
+                "Pass bytes, a seekable file or a re-iterable object instead."
+            )
+        self._started = True
+        return replay
+
+    def open(self) -> Iterator[bytes]:
+        """An iterator over the body's chunks (starts it, or replays it)."""
+        if self.is_async:
+            raise TypeError(
+                "An async iterable request body can only be sent with AsyncClient; "
+                "use a regular iterable with Client."
+            )
+        replay = self._begin()
+        if self._parts is not None:
+            return self._part_chunks(replay)
+        return (_checked_chunk(chunk) for chunk in self._source if chunk)
+
+    def _part_chunks(self, rewind: bool) -> Iterator[bytes]:
+        assert self._parts is not None
+        for part in self._parts:
+            if isinstance(part, bytes):
+                yield part
+            else:
+                yield from part.chunks(rewind)
+
+    async def aopen(self) -> AsyncIterator[bytes]:
+        """Async twin of :meth:`open`; also accepts async iterables."""
+        if not self.is_async:
+            for chunk in self.open():
+                yield chunk
+            return
+        self._begin()
+        async for chunk in self._source:
+            if chunk:
+                yield _checked_chunk(chunk)
+
+    def read(self) -> bytes:
+        """Produce the whole body in memory."""
+        return b"".join(self.open())
+
+    async def aread(self) -> bytes:
+        return b"".join([chunk async for chunk in self.aopen()])
+
+    def __repr__(self) -> str:
+        size = "unknown length" if self.length is None else f"{self.length} bytes"
+        return f"<RequestStream [{size}]>"
+
+
+def _file_part(name: str, value: FileTypes) -> tuple[dict[str, str], bytes | _FilePart]:
     filename: str | None
     content_type: str | None = None
     extra_headers: Mapping[str, str] = {}
@@ -685,12 +865,15 @@ def _file_part(name: str, value: FileTypes) -> tuple[dict[str, str], bytes]:
         content = value
         raw_name = getattr(value, "name", None)
         filename = os.path.basename(raw_name) if isinstance(raw_name, str) else "upload"
+    data: bytes | _FilePart
     if isinstance(content, str):
         data = content.encode("utf-8")
     elif isinstance(content, (bytes, bytearray, memoryview)):
         data = bytes(content)
+    elif _as_upload_file(content) is not None:
+        data = _FilePart(content)  # read while the request is sent
     else:
-        # Typed as IO[bytes], but be forgiving about files opened in text mode.
+        # In-memory or text-mode file: read it now.
         read: Any = content.read()
         data = read.encode("utf-8") if isinstance(read, str) else bytes(read)
     if content_type is None:
@@ -711,11 +894,15 @@ def _escape_quoted(value: str) -> str:
 
 def encode_multipart(
     data: RequestData | None, files: RequestFiles, boundary: str | None = None
-) -> tuple[bytes, str]:
-    """Encode ``multipart/form-data``; returns ``(body, content_type)``."""
+) -> tuple[bytes | RequestStream, str]:
+    """Encode ``multipart/form-data``; returns ``(body, content_type)``.
+
+    The body is ``bytes`` unless a part is an open file, in which case it is a
+    :class:`RequestStream` that reads the files as the request is sent.
+    """
     boundary = boundary or os.urandom(16).hex()
     delimiter = f"--{boundary}\r\n".encode("ascii")
-    out: list[bytes] = []
+    out: list[bytes | _FilePart] = []
     if data:
         if isinstance(data, (str, bytes)):
             raise TypeError("`data` must be a mapping or a list of pairs when `files` is used")
@@ -737,15 +924,28 @@ def encode_multipart(
         files.items() if isinstance(files, Mapping) else files
     )
     for name, value in file_items:
-        headers, payload = _file_part(name, value)
+        headers, part = _file_part(name, value)
         out.append(delimiter)
         for header_name, header_value in headers.items():
             out.append(f"{header_name}: {header_value}\r\n".encode())
         out.append(b"\r\n")
-        out.append(payload)
+        out.append(part)
         out.append(b"\r\n")
     out.append(f"--{boundary}--\r\n".encode("ascii"))
-    return b"".join(out), f"multipart/form-data; boundary={boundary}"
+    content_type = f"multipart/form-data; boundary={boundary}"
+    if all(isinstance(piece, bytes) for piece in out):
+        return b"".join(piece for piece in out if isinstance(piece, bytes)), content_type
+    # Merge neighbouring byte pieces so only the files are separate parts.
+    parts: list[bytes | _FilePart] = []
+    pending: list[bytes] = []
+    for piece in out:
+        if isinstance(piece, bytes):
+            pending.append(piece)
+        else:
+            parts.extend((b"".join(pending), piece))
+            pending = []
+    parts.append(b"".join(pending))
+    return RequestStream(parts=parts), content_type
 
 
 def encode_body(
@@ -753,10 +953,13 @@ def encode_body(
     data: RequestData | None,
     json: Any,
     files: RequestFiles | None,
-) -> tuple[bytes, str | None]:
+) -> tuple[bytes | RequestStream, str | None]:
     """Turn the ``content=`` / ``data=`` / ``json=`` / ``files=`` arguments into
     ``(body, content_type)``. At most one of content / json / (data, files) wins,
     in that order of precedence.
+
+    The body is ``bytes``, or a :class:`RequestStream` for bodies that are
+    produced while the request is sent (generators, open files).
     """
     if content is not None:
         if isinstance(content, bytes):
@@ -765,9 +968,18 @@ def encode_body(
             return content.encode("utf-8"), "text/plain; charset=utf-8"
         if isinstance(content, (bytearray, memoryview)):
             return bytes(content), None
-        # Any other iterable of byte chunks is buffered (uploads are not
-        # streamed in this release).
-        return b"".join(content), None
+        if isinstance(content, (list, tuple)):
+            return b"".join(content), None
+        if _as_upload_file(content) is not None:
+            return RequestStream(parts=[_FilePart(content)]), None
+        reader = getattr(content, "read", None)
+        if callable(reader):
+            # In-memory or text-mode file: read it now.
+            read: Any = reader()
+            return (read.encode("utf-8") if isinstance(read, str) else bytes(read)), None
+        if hasattr(content, "__aiter__") or hasattr(content, "__iter__"):
+            return RequestStream(content), None
+        raise TypeError(f"unsupported `content` type: {type(content).__name__}")
     if json is not None:
         return json_dumps(json), "application/json"
     if files:
@@ -788,6 +1000,23 @@ def encode_body(
                 pairs.append((key, _primitive_to_str(value)))
         return urlencode(pairs).encode("ascii"), "application/x-www-form-urlencoded"
     return b"", None
+
+
+def body_headers(
+    body: bytes | RequestStream, content_type: str | None, headers: Headers
+) -> list[tuple[str, str]]:
+    """The ``content-type`` / ``content-length`` headers ``body`` adds to
+    ``headers`` (explicit headers always win)."""
+    extra: list[tuple[str, str]] = []
+    if content_type is not None and "content-type" not in headers:
+        extra.append(("content-type", content_type))
+    if "content-length" not in headers and "transfer-encoding" not in headers:
+        if isinstance(body, bytes):
+            if body:
+                extra.append(("content-length", str(len(body))))
+        elif body.length is not None:
+            extra.append(("content-length", str(body.length)))
+    return extra
 
 
 def encode_cookie_pairs(cookies: CookieTypes | None) -> str | None:
@@ -820,12 +1049,14 @@ class Request:
     """
 
     __slots__ = (
+        "_auth",
         "_cookie_base",
         "_extensions",
         "_prepared",
         "content",
         "headers",
         "method",
+        "stream",
         "timeout",
         "url",
     )
@@ -851,11 +1082,12 @@ class Request:
         )
         self.headers: Headers = Headers(headers)
         body, content_type = encode_body(content, data, json, files)
-        self.content: bytes = body
-        if content_type is not None and "content-type" not in self.headers:
-            self.headers["content-type"] = content_type
-        if body and "content-length" not in self.headers:
-            self.headers["content-length"] = str(len(body))
+        #: The body, when it is held in memory (``b""`` for a streamed body).
+        self.content: bytes = body if isinstance(body, bytes) else b""
+        #: The body, when it is produced while the request is sent.
+        self.stream: RequestStream | None = None if isinstance(body, bytes) else body
+        for name, value in body_headers(body, content_type, self.headers):
+            self.headers[name] = value
         self.timeout: Timeout | _Unset | None = (
             UNSET if isinstance(timeout, _Unset) else coerce_timeout(timeout)
         )
@@ -866,6 +1098,8 @@ class Request:
         self._cookie_base: str | None = "; ".join(p for p in (explicit, pairs) if p) or None
         self._extensions: dict[str, Any] | None = extensions
         self._prepared: bool = False
+        #: An auth object whose flow needs to see responses (set by the client).
+        self._auth: Any = None
 
     @classmethod
     def _build(
@@ -883,11 +1117,37 @@ class Request:
         self.url = url
         self.headers = headers
         self.content = content
+        self.stream = None
         self.timeout = timeout
         self._cookie_base = cookie_base
         self._extensions = None
         self._prepared = True
+        self._auth = None
         return self
+
+    def read(self) -> bytes:
+        """The whole body as ``bytes``, reading a streamed body into memory.
+
+        After this the request is no longer streamed: ``content`` holds the
+        body and ``stream`` is ``None``.
+        """
+        if self.stream is not None:
+            if self.stream.is_async:
+                raise TypeError("This request has an async body; use `await request.aread()`.")
+            self._buffer(self.stream.read())
+        return self.content
+
+    async def aread(self) -> bytes:
+        """Async twin of :meth:`read`."""
+        if self.stream is not None:
+            self._buffer(await self.stream.aread())
+        return self.content
+
+    def _buffer(self, body: bytes) -> None:
+        self.content = body
+        self.stream = None
+        if "transfer-encoding" not in self.headers:
+            self.headers["content-length"] = str(len(body))
 
     @property
     def extensions(self) -> dict[str, Any]:

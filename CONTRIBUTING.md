@@ -81,9 +81,11 @@ benches/              benchmark server and runner
 
 1. **Never hold the GIL while waiting on I/O.** Blocking calls go through
    `block_on_interruptible` (which detaches from the interpreter); async calls
-   complete through `LoopBridge` or `pyo3-async-runtimes`. Code that runs on a
-   Tokio worker must not touch Python objects - return plain Rust data and convert
-   it at the boundary.
+   complete through `LoopBridge` (use `spawn_awaitable` for a new awaitable). Code
+   that runs on a Tokio worker must not touch Python objects - return plain Rust
+   data and convert it at the boundary.
+   The one deliberate exception is the body iterator of a sync streamed upload,
+   which is called on the caller's own thread from inside `block_on`.
 2. **Keep the stubs in sync.** Every symbol exported from Rust needs a matching
    entry in `python/nextreq/_nextreq.pyi`; `mypy --strict` and
    `tests/test_typing.py` guard this.

@@ -11,21 +11,33 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import inspect
 import os
+import re
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Generator, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypedDict, TypeVar, Union, overload
 
 from . import _nextreq
-from ._nextreq import HttpClient, LoopBridge, RetryPolicy, Timeout, WebSocketConnection
+from ._nextreq import (
+    HttpClient,
+    LoopBridge,
+    RetryPolicy,
+    Timeout,
+    UploadStream,
+    WebSocketConnection,
+    loop_bridge,
+    request_target,
+)
 from .exceptions import (
     ClientClosed,
     DecodingError,
     LocalProtocolError,
     NextReqError,
     ReadTimeout,
+    StreamConsumed,
     TooManyRedirects,
     TransportError,
     UnsupportedProtocol,
@@ -44,10 +56,12 @@ from .models import (
     RequestContent,
     RequestData,
     RequestFiles,
+    RequestStream,
     Response,
     TimeoutTypes,
     URLTypes,
     _Unset,
+    body_headers,
     coerce_timeout,
     encode_body,
     encode_cookie_pairs,
@@ -66,6 +80,8 @@ __all__ = [
     "BasicAuth",
     "BearerAuth",
     "Client",
+    "DigestAuth",
+    "SyncWebSocket",
     "Transport",
     "WebSocket",
     "delete",
@@ -141,10 +157,53 @@ class AsyncTransport(Protocol):
 
 
 class Auth:
-    """Base class for request authentication. Subclasses mutate the request."""
+    """Base class for request authentication.
+
+    Simple schemes implement ``__call__`` and set a header on the request.
+
+    Schemes that depend on the server's answer (challenge / response, token
+    refresh) override :meth:`auth_flow` instead: a generator that yields the
+    request to send and receives the response to it, as often as it needs::
+
+        class RefreshingAuth(nextreq.Auth):
+            def auth_flow(self, request):
+                request.headers["authorization"] = f"Bearer {self.token}"
+                response = yield request
+                if response.status_code == 401:
+                    self.token = fetch_new_token()
+                    request.headers["authorization"] = f"Bearer {self.token}"
+                    yield request
+
+    The same generator drives ``Client`` and ``AsyncClient``, so it must not
+    block. Set ``requires_response_body = True`` if the flow reads the body of
+    the responses it receives.
+    """
+
+    requires_response_body: bool = False
 
     def __call__(self, request: Request) -> Request | None:
         raise NotImplementedError
+
+    def auth_flow(self, request: Request) -> Generator[Request, Response, None]:
+        replaced = self(request)
+        yield replaced if isinstance(replaced, Request) else request
+
+
+def _has_flow(auth: object) -> bool:
+    """Whether ``auth`` needs to see responses (it overrides ``auth_flow``)."""
+    return isinstance(auth, Auth) and type(auth).auth_flow is not Auth.auth_flow
+
+
+def _attach_auth(request: Request, auth: Callable[[Request], Any]) -> Request:
+    """Apply ``auth`` now, or - for a response-aware flow - at send time."""
+    if _has_flow(auth):
+        request._auth = auth
+        return request
+    replaced = auth(request)
+    if isinstance(replaced, Request):
+        replaced._prepared = True
+        return replaced
+    return request
 
 
 class BasicAuth(Auth):
@@ -169,6 +228,142 @@ class BearerAuth(Auth):
     def __call__(self, request: Request) -> Request:
         request.headers["authorization"] = self._header
         return request
+
+
+_DIGEST_ALGORITHMS: dict[str, str] = {
+    "MD5": "md5",
+    "SHA": "sha1",
+    "SHA-256": "sha256",
+    "SHA-512": "sha512",
+    "SHA-512-256": "sha512_256",
+}
+_AUTH_PARAM = re.compile(r'\s*,?\s*([\w-]+)\s*=\s*("(?:[^"\\]|\\.)*"|[^\s,]*)')
+
+
+def _parse_digest_challenge(header: str) -> dict[str, str] | None:
+    """The parameters of the ``Digest`` challenge in a ``WWW-Authenticate`` value.
+
+    The value may carry several challenges (``Basic realm="a", Digest ...``);
+    only the parameters that belong to ``Digest`` are returned.
+    """
+    found = re.search(r"(?:^|,)\s*digest\s+", header, re.IGNORECASE)
+    if found is None:
+        return None
+    params: dict[str, str] = {}
+    position = found.end()
+    while (pair := _AUTH_PARAM.match(header, position)) is not None:
+        value = pair.group(2)
+        if value.startswith('"'):
+            value = re.sub(r"\\(.)", r"\1", value[1:-1])
+        params[pair.group(1).lower()] = value
+        position = pair.end()
+    return params if "nonce" in params else None
+
+
+def _quote_auth_value(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+class DigestAuth(Auth):
+    """HTTP Digest authentication (RFC 7616, compatible with RFC 2617 / 2069).
+
+    The first request is sent without credentials; when the server answers
+    ``401`` with a ``Digest`` challenge the request is repeated with the
+    response to it. The challenge is remembered, so later requests
+    authenticate straight away.
+
+    Supports the ``MD5``, ``SHA``, ``SHA-256``, ``SHA-512`` and ``SHA-512-256``
+    algorithms and their ``-sess`` variants, with ``qop=auth``.
+    """
+
+    def __init__(self, username: str | bytes, password: str | bytes) -> None:
+        self._username = username.encode("utf-8") if isinstance(username, str) else username
+        self._password = password.encode("utf-8") if isinstance(password, str) else password
+        self._challenge: dict[str, str] | None = None
+        self._nonce_count = 0
+        self._lock = threading.Lock()
+
+    def auth_flow(self, request: Request) -> Generator[Request, Response, None]:
+        challenge = self._challenge
+        if challenge is not None:
+            request.headers["authorization"] = self._authorization(request, challenge)
+        response = yield request
+        if response.status_code != 401:
+            return
+        challenge = _parse_digest_challenge(
+            ", ".join(response.headers.get_list("www-authenticate"))
+        )
+        if challenge is None:
+            return
+        answered = "authorization" in request.headers
+        if (
+            answered
+            and challenge.get("stale", "").lower() != "true"
+            and self._same_nonce(challenge)
+        ):
+            return  # the credentials themselves were rejected; do not loop
+        with self._lock:
+            self._challenge = challenge
+            self._nonce_count = 0
+        request.headers["authorization"] = self._authorization(request, challenge)
+        yield request
+
+    def _same_nonce(self, challenge: dict[str, str]) -> bool:
+        current = self._challenge
+        return current is not None and current.get("nonce") == challenge.get("nonce")
+
+    def _cnonce(self) -> str:
+        return os.urandom(16).hex()
+
+    def _authorization(self, request: Request, challenge: dict[str, str]) -> str:
+        algorithm = challenge.get("algorithm", "MD5")
+        name = algorithm.upper()
+        session = name.endswith("-SESS")
+        hash_name = _DIGEST_ALGORITHMS.get(name[:-5] if session else name)
+        if hash_name is None or hash_name not in hashlib.algorithms_available:
+            raise LocalProtocolError(f"unsupported Digest auth algorithm {algorithm!r}")
+
+        def digest(data: bytes) -> str:
+            return hashlib.new(hash_name, data).hexdigest()
+
+        qop_options = [option.strip().lower() for option in challenge.get("qop", "").split(",")]
+        qop_options = [option for option in qop_options if option]
+        if qop_options and "auth" not in qop_options:
+            raise LocalProtocolError(
+                f"unsupported Digest auth quality of protection {challenge.get('qop')!r} "
+                '(only "auth" is supported)'
+            )
+        realm = challenge.get("realm", "")
+        nonce = challenge["nonce"]
+        uri = request_target(request.url._url)  # exactly as sent on the wire
+        cnonce = self._cnonce()
+        with self._lock:
+            self._nonce_count += 1
+            nonce_count = f"{self._nonce_count:08x}"
+
+        ha1 = digest(b":".join((self._username, realm.encode("utf-8"), self._password)))
+        if session:
+            ha1 = digest(f"{ha1}:{nonce}:{cnonce}".encode())
+        ha2 = digest(f"{request.method}:{uri}".encode())
+        if qop_options:
+            response = digest(f"{ha1}:{nonce}:{nonce_count}:{cnonce}:auth:{ha2}".encode())
+        else:  # RFC 2069
+            response = digest(f"{ha1}:{nonce}:{ha2}".encode())
+
+        fields = [
+            f"username={_quote_auth_value(self._username.decode('utf-8', 'replace'))}",
+            f"realm={_quote_auth_value(realm)}",
+            f"nonce={_quote_auth_value(nonce)}",
+            f"uri={_quote_auth_value(uri)}",
+            f'response="{response}"',
+        ]
+        if "algorithm" in challenge:
+            fields.append(f"algorithm={algorithm}")
+        if "opaque" in challenge:
+            fields.append(f"opaque={_quote_auth_value(challenge['opaque'])}")
+        if qop_options:
+            fields.extend(("qop=auth", f"nc={nonce_count}", f'cnonce="{cnonce}"'))
+        return "Digest " + ", ".join(fields)
 
 
 def _coerce_auth(auth: AuthTypes) -> Callable[[Request], Any] | None:
@@ -426,13 +621,10 @@ class _BaseClient:
             header_list.extend(extra)
         merged = Headers._from_raw(header_list)
 
-        body = b""
+        body: bytes | RequestStream = b""
         if content is not None or data is not None or json is not None or files:
             body, content_type = encode_body(content, data, json, files)
-            if content_type is not None and "content-type" not in merged:
-                header_list.append(("content-type", content_type))
-            if body and "content-length" not in merged:
-                header_list.append(("content-length", str(len(body))))
+            header_list.extend(body_headers(body, content_type, merged))
             merged._map = None
 
         cookie_base: str | None = None
@@ -455,18 +647,17 @@ class _BaseClient:
             method.upper(),
             target_url,
             merged,
-            body,
+            body if isinstance(body, bytes) else b"",
             self._timeout if isinstance(timeout, _Unset) else coerce_timeout(timeout),
             cookie_base,
         )
+        if not isinstance(body, bytes):
+            request.stream = body
         if extensions:
             request._extensions = dict(extensions)
         authenticator = self._auth if isinstance(auth, _Unset) else _coerce_auth(auth)
         if authenticator is not None:
-            replaced = authenticator(request)
-            if isinstance(replaced, Request):
-                replaced._prepared = True
-                request = replaced
+            request = _attach_auth(request, authenticator)
         return request
 
     def _prepare(self, request: Request) -> Request:
@@ -485,12 +676,10 @@ class _BaseClient:
             self._timeout if isinstance(request.timeout, _Unset) else request.timeout,
             request._cookie_base,
         )
+        prepared.stream = request.stream
         prepared._extensions = request._extensions
         if self._auth is not None and "authorization" not in explicit:
-            replaced = self._auth(prepared)
-            if isinstance(replaced, Request):
-                replaced._prepared = True
-                prepared = replaced
+            prepared = _attach_auth(prepared, self._auth)
         return prepared
 
     def _coerce_gather_item(self, item: GatherItem) -> Request:
@@ -550,12 +739,21 @@ class _BaseClient:
 
         headers = request.headers.copy()
         content = request.content
+        body_stream = request.stream
         if method != request.method and method == "GET":
             content = b""
+            body_stream = None
             for name in _BODY_HEADERS:
                 if name in headers:
                     del headers[name]
+        elif body_stream is not None and not body_stream.replayable:
+            raise StreamConsumed(
+                f"Cannot follow the {status} redirect to {url}: it requires sending the "
+                "request body again, but the body is a one-shot stream. "
+                "Pass bytes, a seekable file or a re-iterable object instead."
+            )
         cookie_base = request._cookie_base
+        flow_auth = request._auth
         if url.origin != request.url.origin:
             same_host_upgrade = (
                 url.host == request.url.host
@@ -569,13 +767,16 @@ class _BaseClient:
                 if "authorization" in headers:
                     del headers["authorization"]
                 cookie_base = None
+                flow_auth = None
         for name in ("host", "cookie"):
             if name in headers:
                 del headers[name]
         redirected = Request._build(
             method, url, headers, content, _prepared_timeout(request), cookie_base
         )
+        redirected.stream = body_stream
         redirected._extensions = request._extensions
+        redirected._auth = flow_auth
         return redirected
 
     def _check_open(self) -> None:
@@ -593,9 +794,58 @@ class _BaseClient:
         return f"<{type(self).__name__}{base}>"
 
 
+def _websocket_handshake(
+    client: _BaseClient,
+    url: URLTypes,
+    headers: HeaderTypes | None,
+    auth: AuthTypes | _Unset,
+    timeout: TimeoutTypes | _Unset,
+) -> tuple[str, list[tuple[str, str]], Timeout | None]:
+    """Build the URL, headers and timeout of a WebSocket handshake."""
+    request = client.build_request("GET", url, headers=headers, auth=auth, timeout=timeout)
+    target = str(request.url)
+    if target.startswith("http://"):
+        target = "ws://" + target[7:]
+    elif target.startswith("https://"):
+        target = "wss://" + target[8:]
+    if client._cookies._jar or request._cookie_base is not None:
+        request.url = URL(target)
+        client._apply_cookies(request)
+    handshake_headers = [
+        item for item in request.headers._list if item[0] not in ("accept", "accept-encoding")
+    ]
+    return target, handshake_headers, _prepared_timeout(request)
+
+
 def _prepared_timeout(request: Request) -> Timeout | None:
     timeout = request.timeout
     return None if isinstance(timeout, _Unset) else timeout
+
+
+def _can_resend(request: Request) -> bool:
+    """Whether the request body can be produced again (for a retry)."""
+    return request.stream is None or request.stream.replayable
+
+
+async def _pump_upload(stream: RequestStream, upload: UploadStream) -> None:
+    """Feed a streamed request body to the engine as the connection takes it."""
+    try:
+        async for chunk in stream.aopen():
+            status = upload.try_send(chunk)
+            if status == 1:  # queue full: wait for the connection to catch up
+                status = 0 if await upload.send(chunk) else 2
+            if status == 2:  # the request ended without needing the rest
+                return
+    except BaseException:
+        upload.fail()
+        raise
+    upload.finish()
+
+
+def _retrieve_exception(task: asyncio.Future[Any]) -> None:
+    """Done-callback for a detached task, so its failure is not logged as unretrieved."""
+    if not task.cancelled():
+        task.exception()
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -728,12 +978,13 @@ class Client(_BaseClient):
         try:
             raw = self._raw
             if raw is not None:
+                body_stream = request.stream
                 response = Response._from_raw(
                     raw.send(
                         request.method,
                         request.url._url,
                         request.headers._list,
-                        request.content or None,
+                        (request.content or None) if body_stream is None else body_stream.open(),
                         request.timeout,  # type: ignore[arg-type]
                         stream,
                     ),
@@ -742,6 +993,8 @@ class Client(_BaseClient):
             else:
                 assert self._transport is not None
                 started = time.perf_counter()
+                if request.stream is not None:
+                    request.read()  # in-process transports take the body in one piece
                 response = self._transport.handle_request(request)
                 if response.request is None:
                     response.request = request
@@ -761,8 +1014,31 @@ class Client(_BaseClient):
                 response_hook(response)
         return response
 
+    def _exchange_authed(self, request: Request, stream: bool) -> Response:
+        """One exchange, or as many as the request's auth flow asks for."""
+        auth = request._auth
+        if auth is None:
+            return self._exchange(request, stream)
+        flow = auth.auth_flow(request)
+        try:
+            current = next(flow)
+            while True:
+                if not current._prepared:
+                    current = self._prepare(current)
+                    current._auth = None
+                response = self._exchange(current, stream)
+                if stream and auth.requires_response_body:
+                    response.read()
+                try:
+                    current = flow.send(response)
+                except StopIteration:
+                    return response
+                response.close()  # an intermediate answer (e.g. the 401 challenge)
+        finally:
+            flow.close()
+
     def _send_following(self, request: Request, stream: bool, follow: bool) -> Response:
-        response = self._exchange(request, stream)
+        response = self._exchange_authed(request, stream)
         if (
             not follow
             or response.status_code not in _REDIRECT_STATUSES
@@ -779,7 +1055,7 @@ class Client(_BaseClient):
             finally:
                 response.close()
             history.append(response)
-            response = self._exchange(request, stream)
+            response = self._exchange_authed(request, stream)
             if response.status_code not in _REDIRECT_STATUSES or "location" not in response.headers:
                 break
         response.history = history
@@ -794,12 +1070,16 @@ class Client(_BaseClient):
             try:
                 response = self._send_following(request, stream, follow)
             except TransportError as exc:
-                if attempt >= limit or not _is_retryable(exc):
+                if attempt >= limit or not _is_retryable(exc) or not _can_resend(request):
                     exc.retry_count = attempt  # type: ignore[attr-defined]
                     raise
                 delay = policy.delay(attempt + 1)
             else:
-                if attempt >= limit or not policy.allows_status(response.status_code):
+                if (
+                    attempt >= limit
+                    or not policy.allows_status(response.status_code)
+                    or not _can_resend(request)
+                ):
                     response.retry_count = attempt
                     return response
                 delay = policy.delay(attempt + 1, response.headers.get("retry-after"))
@@ -982,6 +1262,47 @@ class Client(_BaseClient):
         finally:
             response.close()
 
+    # -- websockets -------------------------------------------------------
+
+    def websocket(
+        self,
+        url: URLTypes,
+        *,
+        headers: HeaderTypes | None = None,
+        subprotocols: Iterable[str] | None = None,
+        auth: AuthTypes | _Unset = UNSET,
+        timeout: TimeoutTypes | _Unset = UNSET,
+        max_message_size: int | None = None,
+        compression: bool = False,
+    ) -> SyncWebSocket:
+        """Open a WebSocket connection and return it once the handshake is done.
+
+        ::
+
+            with client.websocket("wss://example.com/ws") as ws:
+                ws.send_json({"hello": "world"})
+                reply = ws.receive_json()
+
+        The connection uses the client's TLS settings, proxies, cookies and
+        default headers. ``compression=True`` offers permessage-deflate; check
+        ``ws.compressed`` to see whether the server accepted it.
+        """
+        self._check_open()
+        if self._raw is None:
+            raise WebSocketError("WebSockets are not supported with a custom transport or `app`.")
+        target, handshake_headers, prepared_timeout = _websocket_handshake(
+            self, url, headers, auth, timeout
+        )
+        connection = self._raw.ws_connect_blocking(
+            target,
+            handshake_headers,
+            list(subprotocols) if subprotocols else None,
+            prepared_timeout,
+            max_message_size,
+            compression,
+        )
+        return SyncWebSocket(connection)
+
     def close(self) -> None:
         """Close the client and its connection pool."""
         if self._closed:
@@ -1108,7 +1429,7 @@ class AsyncClient(_BaseClient):
     def _bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Attach to the running event loop (a client may outlive one loop)."""
         self._loop = loop
-        self._bridge = LoopBridge(loop.call_soon_threadsafe)
+        self._bridge = loop_bridge(loop)
 
     async def _exchange(self, request: Request, stream: bool) -> Response:
         """One request/response exchange, with cookies and hooks applied."""
@@ -1126,26 +1447,34 @@ class AsyncClient(_BaseClient):
                 if loop is not self._loop:
                     self._bind_loop(loop)
                 future = loop.create_future()
-                task = raw.send_async(
-                    self._bridge,  # type: ignore[arg-type]
-                    future,
-                    request.method,
-                    request.url._url,
-                    request.headers._list,
-                    request.content or None,
-                    request.timeout,  # type: ignore[arg-type]
-                    stream,
-                )
-                try:
-                    response = Response._from_raw(await future, request)
-                except BaseException:
-                    # Cancelled (or failed): stop the in-flight request so its
-                    # connection slot is released immediately.
-                    task.abort()
-                    raise
+                body_stream = request.stream
+                if body_stream is None:
+                    task = raw.send_async(
+                        self._bridge,  # type: ignore[arg-type]
+                        future,
+                        request.method,
+                        request.url._url,
+                        request.headers._list,
+                        request.content or None,
+                        request.timeout,  # type: ignore[arg-type]
+                        stream,
+                    )
+                    try:
+                        response = Response._from_raw(await future, request)
+                    except BaseException:
+                        # Cancelled (or failed): stop the in-flight request so its
+                        # connection slot is released immediately.
+                        task.abort()
+                        raise
+                else:
+                    response = await self._exchange_streamed(
+                        raw, loop, future, request, body_stream, stream
+                    )
             else:
                 assert self._transport is not None
                 started = time.perf_counter()
+                if request.stream is not None:
+                    await request.aread()  # in-process transports take the body in one piece
                 response = await self._transport.handle_async_request(request)
                 if response.request is None:
                     response.request = request
@@ -1169,8 +1498,75 @@ class AsyncClient(_BaseClient):
                     await pending
         return response
 
+    async def _exchange_streamed(
+        self,
+        raw: HttpClient,
+        loop: asyncio.AbstractEventLoop,
+        future: asyncio.Future[Any],
+        request: Request,
+        body_stream: RequestStream,
+        stream: bool,
+    ) -> Response:
+        """Send a request whose body is produced while it is in flight."""
+        upload = UploadStream()
+        task = raw.send_async(
+            self._bridge,  # type: ignore[arg-type]
+            future,
+            request.method,
+            request.url._url,
+            request.headers._list,
+            upload,
+            request.timeout,  # type: ignore[arg-type]
+            stream,
+        )
+        pump = loop.create_task(_pump_upload(body_stream, upload))
+        try:
+            result = await future
+        except BaseException as exc:
+            task.abort()
+            if pump.done() and not pump.cancelled():
+                failure = pump.exception()
+                if failure is not None and not isinstance(exc, asyncio.CancelledError):
+                    # The body could not be produced: that is the real error.
+                    raise failure from None
+            pump.cancel()
+            pump.add_done_callback(_retrieve_exception)
+            raise
+        if not pump.done():
+            if stream:
+                # A streaming response may arrive while the body is still being
+                # sent; the upload continues until the response is closed.
+                pump.add_done_callback(_retrieve_exception)
+            else:
+                pump.cancel()  # the exchange is complete; the rest is not needed
+                pump.add_done_callback(_retrieve_exception)
+        return Response._from_raw(result, request)
+
+    async def _exchange_authed(self, request: Request, stream: bool) -> Response:
+        """One exchange, or as many as the request's auth flow asks for."""
+        auth = request._auth
+        if auth is None:
+            return await self._exchange(request, stream)
+        flow = auth.auth_flow(request)
+        try:
+            current = next(flow)
+            while True:
+                if not current._prepared:
+                    current = self._prepare(current)
+                    current._auth = None
+                response = await self._exchange(current, stream)
+                if stream and auth.requires_response_body:
+                    await response.aread()
+                try:
+                    current = flow.send(response)
+                except StopIteration:
+                    return response
+                await response.aclose()  # an intermediate answer (e.g. the 401 challenge)
+        finally:
+            flow.close()
+
     async def _send_following(self, request: Request, stream: bool, follow: bool) -> Response:
-        response = await self._exchange(request, stream)
+        response = await self._exchange_authed(request, stream)
         if (
             not follow
             or response.status_code not in _REDIRECT_STATUSES
@@ -1187,7 +1583,7 @@ class AsyncClient(_BaseClient):
             finally:
                 await response.aclose()
             history.append(response)
-            response = await self._exchange(request, stream)
+            response = await self._exchange_authed(request, stream)
             if response.status_code not in _REDIRECT_STATUSES or "location" not in response.headers:
                 break
         response.history = history
@@ -1202,12 +1598,16 @@ class AsyncClient(_BaseClient):
             try:
                 response = await self._send_following(request, stream, follow)
             except TransportError as exc:
-                if attempt >= limit or not _is_retryable(exc):
+                if attempt >= limit or not _is_retryable(exc) or not _can_resend(request):
                     exc.retry_count = attempt  # type: ignore[attr-defined]
                     raise
                 delay = policy.delay(attempt + 1)
             else:
-                if attempt >= limit or not policy.allows_status(response.status_code):
+                if (
+                    attempt >= limit
+                    or not policy.allows_status(response.status_code)
+                    or not _can_resend(request)
+                ):
                     response.retry_count = attempt
                     return response
                 delay = policy.delay(attempt + 1, response.headers.get("retry-after"))
@@ -1482,6 +1882,7 @@ class AsyncClient(_BaseClient):
         auth: AuthTypes | _Unset = UNSET,
         timeout: TimeoutTypes | _Unset = UNSET,
         max_message_size: int | None = None,
+        compression: bool = False,
     ) -> _WebSocketConnector:
         """Open a WebSocket connection.
 
@@ -1490,30 +1891,35 @@ class AsyncClient(_BaseClient):
             async with client.websocket("wss://example.com/ws") as ws:
                 await ws.send_json({"hello": "world"})
                 reply = await ws.receive_json()
+
+        The connection uses the client's TLS settings, proxies, cookies and
+        default headers. ``compression=True`` offers permessage-deflate; check
+        ``ws.compressed`` to see whether the server accepted it.
         """
-        self._check_open()
-        if self._raw is None:
-            raise WebSocketError("WebSockets are not supported with a custom transport or `app`.")
-        request = self.build_request("GET", url, headers=headers, auth=auth, timeout=timeout)
-        target = str(request.url)
-        if target.startswith("http://"):
-            target = "ws://" + target[7:]
-        elif target.startswith("https://"):
-            target = "wss://" + target[8:]
-        if self._cookies._jar or request._cookie_base is not None:
-            request.url = URL(target)
-            self._apply_cookies(request)
-        handshake_headers = [
-            item for item in request.headers._list if item[0] not in ("accept", "accept-encoding")
-        ]
+        engine, target, handshake_headers, prepared_timeout = self._websocket_request(
+            url, headers, auth, timeout
+        )
         return _WebSocketConnector(
-            self._raw,
+            engine,
             target,
             handshake_headers,
             list(subprotocols) if subprotocols else None,
-            _prepared_timeout(request),
+            prepared_timeout,
             max_message_size,
+            compression,
         )
+
+    def _websocket_request(
+        self,
+        url: URLTypes,
+        headers: HeaderTypes | None,
+        auth: AuthTypes | _Unset,
+        timeout: TimeoutTypes | _Unset,
+    ) -> tuple[HttpClient, str, list[tuple[str, str]], Timeout | None]:
+        self._check_open()
+        if self._raw is None:
+            raise WebSocketError("WebSockets are not supported with a custom transport or `app`.")
+        return (self._raw, *_websocket_handshake(self, url, headers, auth, timeout))
 
     async def aclose(self) -> None:
         """Close the client and its connection pool."""
@@ -1536,8 +1942,8 @@ class AsyncClient(_BaseClient):
 # -- websockets ---------------------------------------------------------------
 
 
-class WebSocket:
-    """An open WebSocket connection (see :meth:`AsyncClient.websocket`)."""
+class _WebSocketBase:
+    """State shared by the async and the sync WebSocket."""
 
     def __init__(self, connection: WebSocketConnection) -> None:
         self._conn = connection
@@ -1556,8 +1962,44 @@ class WebSocket:
         return Headers(self._conn.response_headers)
 
     @property
+    def compressed(self) -> bool:
+        """Whether permessage-deflate compression was negotiated."""
+        return self._conn.compressed
+
+    @property
     def closed(self) -> bool:
         return self._closed
+
+    def _check_receivable(self) -> None:
+        if self._closed:
+            raise WebSocketDisconnect(self.close_code or 1006, self.close_reason or "")
+
+    def _unpack(self, message: tuple[int, str | bytes, int]) -> str | bytes:
+        kind, payload, code = message
+        if kind == 2:
+            self._closed = True
+            self.close_code = code
+            self.close_reason = str(payload)
+            raise WebSocketDisconnect(code, str(payload))
+        return payload
+
+    def _mark_closed(self, code: int, reason: str) -> None:
+        if not self._closed:
+            self._closed = True
+            self.close_code = code
+            self.close_reason = reason
+
+
+def _as_text(message: str | bytes) -> str:
+    return message if isinstance(message, str) else message.decode("utf-8")
+
+
+def _as_bytes(message: str | bytes) -> bytes:
+    return message.encode("utf-8") if isinstance(message, str) else message
+
+
+class WebSocket(_WebSocketBase):
+    """An open WebSocket connection (see :meth:`AsyncClient.websocket`)."""
 
     async def send(self, data: str | bytes) -> None:
         """Send a text (``str``) or binary (``bytes``) message."""
@@ -1590,32 +2032,24 @@ class WebSocket:
             WebSocketDisconnect: the peer closed the connection.
             ReadTimeout: no message arrived within ``timeout`` seconds.
         """
-        if self._closed:
-            raise WebSocketDisconnect(self.close_code or 1006, self.close_reason or "")
+        self._check_receivable()
         pending = self._conn.receive()
         if timeout is not None:
             try:
-                kind, payload, code = await asyncio.wait_for(pending, timeout)
+                message = await asyncio.wait_for(pending, timeout)
             except asyncio.TimeoutError:
                 raise ReadTimeout(
                     f"timed out after {timeout:.3f}s waiting for a WebSocket message"
                 ) from None
         else:
-            kind, payload, code = await pending
-        if kind == 2:
-            self._closed = True
-            self.close_code = code
-            self.close_reason = str(payload)
-            raise WebSocketDisconnect(code, str(payload))
-        return payload
+            message = await pending
+        return self._unpack(message)
 
     async def receive_text(self, *, timeout: float | None = None) -> str:
-        message = await self.receive(timeout=timeout)
-        return message if isinstance(message, str) else message.decode("utf-8")
+        return _as_text(await self.receive(timeout=timeout))
 
     async def receive_bytes(self, *, timeout: float | None = None) -> bytes:
-        message = await self.receive(timeout=timeout)
-        return message.encode("utf-8") if isinstance(message, str) else message
+        return _as_bytes(await self.receive(timeout=timeout))
 
     async def receive_json(self, *, timeout: float | None = None) -> Any:
         import json
@@ -1624,10 +2058,7 @@ class WebSocket:
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
         """Perform the closing handshake. Safe to call repeatedly."""
-        if not self._closed:
-            self._closed = True
-            self.close_code = code
-            self.close_reason = reason
+        self._mark_closed(code, reason)
         await self._conn.close(code, reason)
 
     def __aiter__(self) -> Self:
@@ -1646,6 +2077,79 @@ class WebSocket:
         await self.close()
 
 
+class SyncWebSocket(_WebSocketBase):
+    """An open WebSocket connection with a blocking API (see :meth:`Client.websocket`).
+
+    Calls block the calling thread with the GIL released. One thread may sit
+    in :meth:`receive` while another sends.
+    """
+
+    def send(self, data: str | bytes) -> None:
+        """Send a text (``str``) or binary (``bytes``) message."""
+        if isinstance(data, str):
+            self._conn.send_text_blocking(data)
+        else:
+            self._conn.send_bytes_blocking(bytes(data))
+
+    def send_text(self, text: str) -> None:
+        self._conn.send_text_blocking(text)
+
+    def send_bytes(self, data: bytes) -> None:
+        self._conn.send_bytes_blocking(bytes(data))
+
+    def send_json(self, obj: Any, *, mode: Literal["text", "binary"] = "text") -> None:
+        """Serialise ``obj`` to JSON and send it as a text (or binary) message."""
+        payload = json_dumps(obj)
+        if mode == "binary":
+            self._conn.send_bytes_blocking(payload)
+        else:
+            self._conn.send_text_blocking(payload.decode("utf-8"))
+
+    def ping(self, data: bytes = b"") -> None:
+        self._conn.ping_blocking(data)
+
+    def receive(self, *, timeout: float | None = None) -> str | bytes:
+        """Receive the next message.
+
+        Raises:
+            WebSocketDisconnect: the peer closed the connection.
+            ReadTimeout: no message arrived within ``timeout`` seconds.
+        """
+        self._check_receivable()
+        return self._unpack(self._conn.receive_blocking(timeout))
+
+    def receive_text(self, *, timeout: float | None = None) -> str:
+        return _as_text(self.receive(timeout=timeout))
+
+    def receive_bytes(self, *, timeout: float | None = None) -> bytes:
+        return _as_bytes(self.receive(timeout=timeout))
+
+    def receive_json(self, *, timeout: float | None = None) -> Any:
+        import json
+
+        return json.loads(self.receive(timeout=timeout))
+
+    def close(self, code: int = 1000, reason: str = "") -> None:
+        """Perform the closing handshake. Safe to call repeatedly."""
+        self._mark_closed(code, reason)
+        self._conn.close_blocking(code, reason)
+
+    def __iter__(self) -> Self:
+        return self
+
+    def __next__(self) -> str | bytes:
+        try:
+            return self.receive()
+        except WebSocketDisconnect:
+            raise StopIteration from None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+
 class _WebSocketConnector:
     """Awaitable / async context manager returned by ``AsyncClient.websocket()``."""
 
@@ -1657,6 +2161,7 @@ class _WebSocketConnector:
         subprotocols: list[str] | None,
         timeout: Timeout | None,
         max_message_size: int | None,
+        compression: bool = False,
     ) -> None:
         self._engine = engine
         self._url = url
@@ -1664,11 +2169,17 @@ class _WebSocketConnector:
         self._subprotocols = subprotocols
         self._timeout = timeout
         self._max_message_size = max_message_size
+        self._compression = compression
         self._socket: WebSocket | None = None
 
     async def _connect(self) -> WebSocket:
         connection = await self._engine.ws_connect(
-            self._url, self._headers, self._subprotocols, self._timeout, self._max_message_size
+            self._url,
+            self._headers,
+            self._subprotocols,
+            self._timeout,
+            self._max_message_size,
+            self._compression,
         )
         self._socket = WebSocket(connection)
         return self._socket

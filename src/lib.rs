@@ -24,17 +24,21 @@ mod ws;
 /// guards its state with Rust synchronisation primitives.
 #[pymodule]
 fn _nextreq(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    client::init_runtime();
     module.add_class::<client::HttpClient>()?;
     module.add_class::<client::ResponseStream>()?;
     module.add_class::<client::LoopBridge>()?;
     module.add_class::<client::TaskHandle>()?;
+    module.add_class::<client::UploadStream>()?;
     module.add_class::<config::Timeout>()?;
     module.add_class::<config::RetryPolicy>()?;
     module.add_class::<sse::SSEParser>()?;
     module.add_class::<sse::PySseEvent>()?;
     module.add_class::<ws::WebSocketConnection>()?;
     module.add_function(wrap_pyfunction!(config::parse_retry_after, module)?)?;
+    module.add_function(wrap_pyfunction!(client::loop_bridge, module)?)?;
+    module.add_function(wrap_pyfunction!(client::request_target, module)?)?;
+    module.add_function(wrap_pyfunction!(config::is_public_suffix, module)?)?;
+    module.add_function(wrap_pyfunction!(client::after_fork_in_child, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add("HTTP3_ENABLED", cfg!(feature = "http3"))?;
     module.add("DEFAULT_CONNECT_TIMEOUT", config::DEFAULT_CONNECT_TIMEOUT)?;

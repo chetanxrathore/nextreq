@@ -270,6 +270,34 @@ def test_response_cookies_property(client: nextreq.Client) -> None:
     assert response.cookies == {"x": "1"}
 
 
+def test_cookie_jar_uses_the_public_suffix_list() -> None:
+    from nextreq._nextreq import is_public_suffix
+
+    for suffix in ("com", "co.uk", "github.io", "com.au", "localhost", "internal", "CO.UK."):
+        assert is_public_suffix(suffix), suffix
+    for name in ("example.com", "example.co.uk", "user.github.io", "127.0.0.1", "::1", ""):
+        assert not is_public_suffix(name), name
+
+    jar = nextreq.Cookies()
+    # A site under a multi-label public suffix cannot set a cookie for the
+    # whole suffix (it would be sent to every other site under it) ...
+    jar.extract(URL("https://shop.example.co.uk/"), ["super=1; Domain=co.uk"])
+    jar.extract(URL("https://alice.github.io/"), ["super=2; Domain=github.io"])
+    assert jar.header_for(URL("https://other.co.uk/")) is None
+    assert jar.header_for(URL("https://bob.github.io/")) is None
+    assert jar.header_for(URL("https://shop.example.co.uk/")) is None
+    # ... but it can for its own registrable domain.
+    jar.extract(URL("https://shop.example.co.uk/"), ["site=1; Domain=example.co.uk"])
+    assert jar.header_for(URL("https://www.example.co.uk/")) == "site=1"
+    assert jar.header_for(URL("https://other.co.uk/")) is None
+
+    # A host that *is* a public suffix may set a cookie for itself; it is
+    # stored host-only, so subdomains never see it.
+    jar.extract(URL("http://localhost/"), ["dev=1; Domain=localhost"])
+    assert jar.header_for(URL("http://localhost/")) == "dev=1"
+    assert jar.header_for(URL("http://app.localhost/")) is None
+
+
 def test_cookie_jar_scoping_rules() -> None:
     jar = Cookies()
     jar.extract(

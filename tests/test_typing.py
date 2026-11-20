@@ -32,6 +32,7 @@ from nextreq import (
     WebSocket,
 )
 from nextreq._nextreq import HttpClient, ResponseStream, SSEParser
+from nextreq.testing import ASGITransport
 
 if sys.version_info >= (3, 11):
     from typing import assert_type
@@ -209,6 +210,23 @@ def _static_only(engine: HttpClient, stream: ResponseStream, ws: WebSocket) -> N
     assert_type(engine.is_closed, bool)
     assert_type(ws.subprotocol, str | None)
 
+    # Blocking WebSockets, streamed uploads and response-aware auth.
+    with Client().websocket("wss://example.com/ws", compression=True) as sync_socket:
+        assert_type(sync_socket, nextreq.SyncWebSocket)
+        assert_type(sync_socket.receive(timeout=1.0), str | bytes)
+        assert_type(sync_socket.receive_text(), str)
+        assert_type(sync_socket.compressed, bool)
+    with open(__file__, "rb") as handle:
+        assert_type(Client().post("https://example.com", content=handle), Response)
+        assert_type(Client().post("https://example.com", files={"f": handle}), Response)
+    assert_type(Client().put("https://example.com", content=iter([b"chunk"])), Response)
+    request = nextreq.Request("POST", "https://example.com", content=iter([b"chunk"]))
+    assert_type(request.stream, nextreq.RequestStream | None)
+    assert_type(request.read(), bytes)
+    assert_type(
+        Client(auth=nextreq.DigestAuth("user", "pass")).get("https://example.com"), Response
+    )
+
     # Each of these must be a type error.
     nextreq.get("https://example.com", nonsense=True)  # type: ignore[call-overload]
     nextreq.get(42)  # type: ignore[call-overload]
@@ -221,6 +239,10 @@ def _static_only(engine: HttpClient, stream: ResponseStream, ws: WebSocket) -> N
     del wrong
 
 
+async def _asgi_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+    """A stand-in ASGI application for the static checks."""
+
+
 async def _static_only_async(client: AsyncClient) -> None:
     """Never executed; checked by mypy only."""
     async with client.websocket("wss://example.com/ws") as socket:
@@ -229,6 +251,12 @@ async def _static_only_async(client: AsyncClient) -> None:
         assert_type(await socket.receive_text(), str)
         assert_type(await socket.receive_bytes(), bytes)
     assert_type(await nextreq.gather(["https://example.com"]), list[Response])
+
+    async def body() -> AsyncIterator[bytes]:
+        yield b"chunk"
+
+    assert_type(await client.post("https://example.com", content=body()), Response)
+    assert_type(ASGITransport(_asgi_app, lifespan=True).state, dict[str, Any])
     await client.get("https://example.com", follow_redirects="yes")  # type: ignore[call-overload]
 
 
