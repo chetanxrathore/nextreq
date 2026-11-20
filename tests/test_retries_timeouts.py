@@ -256,9 +256,12 @@ def test_proxy_from_environment(
 def test_no_proxy_bypasses_the_environment_proxy(
     server: LiveServer, proxy: ProxyServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Clear first, then set: environment variable names are case-insensitive on
+    # Windows, so deleting "no_proxy" after setting "NO_PROXY" would unset it.
+    for name in ("no_proxy", "NO_PROXY", "http_proxy", "HTTP_PROXY"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HTTP_PROXY", proxy.url)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1")
-    monkeypatch.delenv("no_proxy", raising=False)
     with nextreq.Client() as client:
         assert client.get(f"{server.url}/json").status_code == 200
         assert proxy.requests == []

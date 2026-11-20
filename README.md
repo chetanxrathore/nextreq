@@ -35,7 +35,7 @@ print(r.json(), r.http_version, r.elapsed.total)
   zstd decoding, proxies, optional HTTP/3.
 - **Zero mandatory dependencies.** Python 3.10+, one abi3 wheel per platform.
 
-> **Status:** `0.1.0` release candidate. The API is small and tested (310 Python tests,
+> **Status:** `0.1.0` release candidate. The API is small and tested (311 Python tests,
 > 40 Rust tests; the suite also passes on Python 3.10 against the abi3 wheel, and a
 > threaded smoke test passes on free-threaded CPython 3.14t) but young - see
 > [Limitations](#limitations).

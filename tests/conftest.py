@@ -670,6 +670,13 @@ class ProxyServer:
             loop.run_forever()
         finally:
             server.close()
+            # Let the accept loop and any in-flight handlers finish cancelling
+            # before the loop is closed (the Windows proactor keeps a pending
+            # accept task around otherwise).
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
 
     def close(self) -> None:

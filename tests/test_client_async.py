@@ -325,15 +325,26 @@ async def test_gather_return_exceptions(aclient: nextreq.AsyncClient, unused_por
 
 
 async def test_gather_raises_first_error_and_cancels_the_rest(
-    aclient: nextreq.AsyncClient, server: LiveServer, unused_port: int
+    aclient: nextreq.AsyncClient, server: LiveServer
 ) -> None:
+    # The failing request must fail *immediately* on every platform so the
+    # timing below measures cancellation only. (A refused TCP connection is
+    # not suitable: Windows retries for about 2 seconds before reporting it.)
     started = time.perf_counter()
-    with pytest.raises(nextreq.ConnectError):
+    with pytest.raises(nextreq.UnsupportedProtocol):
         await aclient.gather(
-            [f"http://127.0.0.1:{unused_port}/", *[f"/delay/3?n={n}" for n in range(5)]],
+            ["ftp://unsupported.test/file", *[f"/delay/3?n={n}" for n in range(5)]],
             max_concurrency=6,
         )
     assert time.perf_counter() - started < 2, "pending requests should be cancelled, not awaited"
+    assert (await aclient.get("/json")).status_code == 200
+
+
+async def test_gather_propagates_transport_errors(
+    aclient: nextreq.AsyncClient, unused_port: int
+) -> None:
+    with pytest.raises(nextreq.ConnectError):
+        await aclient.gather(["/json", f"http://127.0.0.1:{unused_port}/"])
     assert (await aclient.get("/json")).status_code == 200
 
 
