@@ -76,7 +76,16 @@ src = ["python", "tests", "benches"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM", "RUF", "PIE", "PERF"]
-ignore = ["E501", "SIM105", "PERF203"]
+ignore = [
+    "E501",    # line length is handled by the formatter
+    "SIM105",  # contextlib.suppress is slower than try/except on hot paths
+    "PERF203", # try/except in loops is intentional (and free on 3.11+)
+    "UP007",   # runtime type aliases with forward references need typing.Union on 3.10
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Nested `with` blocks read better in tests (client scope vs. assertion scope).
+"tests/*" = ["SIM117", "B017", "PT011", "PERF401"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["nextreq"]

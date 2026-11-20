@@ -1004,7 +1004,7 @@ impl HttpClient {
         http2 = true,
         http3 = false,
         max_connections = Some(100),
-        max_keepalive_connections = Some(20),
+        max_keepalive_connections = None,
         keepalive_expiry = Some(30.0),
     ))]
     #[allow(clippy::too_many_arguments)]
