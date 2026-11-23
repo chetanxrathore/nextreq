@@ -2,6 +2,15 @@
 
 **A next-generation, Rust-powered, batteries-included HTTP client for Python.**
 
+[![PyPI](https://img.shields.io/pypi/v/nextreq)](https://pypi.org/project/nextreq/)
+[![Python versions](https://img.shields.io/pypi/pyversions/nextreq)](https://pypi.org/project/nextreq/)
+[![CI](https://github.com/chetanxrathore/nextreq/actions/workflows/ci.yml/badge.svg)](https://github.com/chetanxrathore/nextreq/actions/workflows/ci.yml)
+[![Downloads](https://img.shields.io/pypi/dm/nextreq)](https://pypistats.org/packages/nextreq)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](https://github.com/chetanxrathore/nextreq#license)
+[![Rust core](https://img.shields.io/badge/core-Rust-orange?logo=rust)](https://www.rust-lang.org/)
+[![Typing](https://img.shields.io/badge/typing-mypy%20strict-blue)](https://mypy-lang.org/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 `nextreq` pairs a Rust core (Tokio · hyper/reqwest · rustls) with a small, fully typed
 Python API. You get the ergonomics of `requests`, a first-class `asyncio` client, and
 the things you normally bolt on yourself - retries, typed responses, SSE, WebSockets,
