@@ -46,7 +46,7 @@ print(r.json(), r.http_version, r.elapsed.total)
   zstd decoding, proxies, optional HTTP/3.
 - **Zero mandatory dependencies.** Python 3.10+, one abi3 wheel per platform.
 
-> **Status:** young but thoroughly tested: 387 Python tests and 45 Rust tests, run
+> **Status:** young but thoroughly tested: 403 Python tests and 45 Rust tests, run
 > on CPython 3.10 (against the abi3 wheel) and 3.14, plus a threaded smoke test on
 > free-threaded CPython 3.14t. What it does not do is listed under
 > [Limitations](#limitations).
@@ -132,6 +132,9 @@ async def events():
 await aclient.post("/ingest", content=events())         # async generators work with AsyncClient
 ```
 
+`AsyncClient` reads files in a worker thread, so a slow disk does not stall the event
+loop.
+
 A retry or a `307`/`308` redirect has to send the body again. Seekable files and
 re-iterable objects are rewound and replayed; a one-shot generator cannot be, so such
 a request is not retried, and a redirect that needs the body raises `StreamConsumed`.
@@ -146,8 +149,10 @@ client.get("/private", auth=sign_request)                       # any callable t
 ```
 
 `DigestAuth` implements RFC 7616 (MD5, SHA-256, SHA-512 and their `-sess` variants,
-`qop=auth`). It answers the server's challenge transparently and remembers it, so
-only the first request costs a round trip.
+`qop=auth` and `qop=auth-int`). It answers the server's challenge transparently and
+remembers it, so only the first request costs a round trip. `auth-int` also signs the
+request body and is used only when the server offers nothing else; the body then has
+to be in memory, a seekable file or a re-iterable object.
 
 Schemes that depend on the server's answer subclass `Auth` and write an `auth_flow`
 generator: it yields a request and receives the response to it, as often as it needs
@@ -257,10 +262,27 @@ available on both; a closed connection raises `WebSocketDisconnect(code, reason)
 With the blocking API one thread can wait in `receive()` while another sends.
 
 Connections use the client's TLS settings, default headers, cookies and proxies
-(`http://` proxies via `CONNECT`, `socks5://`, and the proxy environment variables
-including `NO_PROXY`). `compression=True` offers permessage-deflate (RFC 7692);
-`ws.compressed` tells you whether the server accepted it. Pings from the server are
-answered automatically.
+(`http://` and `https://` proxies via `CONNECT`, `socks5://`, and the proxy environment
+variables including `NO_PROXY`). `compression=True` offers permessage-deflate
+(RFC 7692); `ws.compressed` tells you whether the server accepted it. Pings from the
+server are answered automatically.
+
+`auth=` applies to the handshake, including schemes that answer a challenge:
+
+```python
+with client.websocket("wss://example.com/ws", auth=nextreq.DigestAuth("user", "pass")) as ws:
+    ...
+```
+
+When the server refuses the handshake, `WebSocketError.response` holds its answer:
+
+```python
+try:
+    ws = client.websocket("wss://example.com/ws")
+except nextreq.WebSocketError as exc:
+    if exc.response is not None:                 # None for network and protocol errors
+        print(exc.response.status_code, exc.response.text)
+```
 
 ### Concurrency: `gather()`
 
@@ -308,11 +330,18 @@ with nextreq.Client(app=flask_app) as client:                 # WSGI
     assert client.get("/health").json() == {"ok": True}
 ```
 
-Responses from the application are streamed with backpressure, so streaming and SSE
-endpoints can be tested chunk by chunk, and closing a response early is seen by the
-application as a client disconnect. ASGI lifespan events run too: startup before the
-first request, shutdown when the client is closed (`ASGITransport(app, lifespan=False)`
-turns that off), and lifespan state is available to the handlers.
+Bodies are streamed in both directions, with backpressure. Streaming and SSE endpoints
+can be tested chunk by chunk, closing a response early is seen by the application as a
+client disconnect, and a streamed upload reaches the application piece by piece (one
+`http.request` message per chunk for ASGI, `wsgi.input` for WSGI). ASGI lifespan events
+run too: startup before the first request, shutdown when the client is closed
+(`ASGITransport(app, lifespan=False)` turns that off), and lifespan state is available
+to the handlers.
+
+A WSGI application can also be driven from `AsyncClient`
+(`AsyncClient(transport=nextreq.WSGITransport(flask_app))`): it runs in a worker thread
+of its own for as long as the response is open. `MockTransport` reads a streamed upload
+into `request.content`, so matchers and handlers can look at it.
 
 ### Hooks, timings and OpenTelemetry
 
@@ -531,7 +560,8 @@ with ThreadPoolExecutor(max_workers=20) as pool:
   the event loop for the GIL.
 - **Uploads** flow through a small bounded queue: the sync client pulls the next
   chunk from your iterator on the calling thread, the async client from the event
-  loop, and only when the connection has taken the previous ones.
+  loop (files: from a worker thread), and only when the connection has taken the
+  previous ones.
 - **Timeouts** are enforced per request in Rust: pool (semaphore), connect (a
   connector layer covering DNS + TCP + TLS), write (upload progress) and read
   (headers, then each body chunk).
@@ -550,17 +580,11 @@ Known gaps, in rough priority order:
   (`RUSTFLAGS="--cfg reqwest_unstable" maturin build --features http3`), because the
   underlying support is still marked unstable upstream. The published wheels do not
   include it, and it is only compile-checked here, not tested against a server.
-- **No NTLM, Negotiate or Kerberos auth.** Digest supports `qop=auth` but not
-  `auth-int`. Write an `auth_flow` for anything else.
+- **No NTLM, Negotiate or Kerberos auth.** Write an `auth_flow` for a scheme that is
+  not built in.
 - **`max_connections` counts connections in use**, not idle ones. With one host the
   socket count stays at the limit; idle keep-alive connections to *other* hosts come
   on top until they expire (`keepalive_expiry`, `max_keepalive_connections`).
-- **WebSockets** cannot go through an `https://` proxy (TLS to the proxy itself), and
-  flow-based auth such as `DigestAuth` is not applied to the handshake.
-- **`AsyncClient` reads upload files on the event loop**, 64 KiB at a time. For slow
-  disks or network file systems, feed the upload from an async generator instead.
-- **In-process transports** (`MockTransport`, ASGI, WSGI) receive a streamed request
-  body in one piece, and a WSGI application called from `AsyncClient` is buffered.
 - **After `fork()`**, responses and WebSockets that were open in the parent cannot be
   used in the child, and forking while another thread is in the middle of a request
   is not supported (CPython itself warns about forking a multi-threaded process).

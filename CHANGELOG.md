@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+This release closes the gaps that were left in the test transports, in WebSockets and
+in Digest authentication.
+
+### Added
+
+- **Streamed request bodies reach in-process applications as a stream.** With
+  `ASGITransport` the application receives one `http.request` message per chunk, and
+  with `WSGITransport` it reads them from `wsgi.input`, both only as fast as it asks.
+- **WSGI applications are streamed through `AsyncClient`.** The application runs in a
+  worker thread of its own for as long as the response is open, instead of being
+  buffered.
+- **WebSockets through `https://` proxies**: TLS to the proxy, `CONNECT` inside it,
+  and for `wss://` a second TLS session to the server inside the tunnel.
+- **Authentication flows on the WebSocket handshake.** `DigestAuth` and custom
+  `auth_flow` classes now answer a challenge on `client.websocket(...)`.
+- **`WebSocketError.response`**: the server's answer (status, headers, body) when it
+  refuses a handshake.
+- **Digest `qop=auth-int`**, which also signs the request body.
+- Custom transports can set `streams_requests = True` to receive streamed request
+  bodies as a stream.
+
+### Changed
+
+- `AsyncClient` reads upload files in a worker thread, so a slow disk no longer
+  stalls the event loop.
+- A one-shot streamed body (a generator) sent to an ASGI or WSGI application is no
+  longer retried and cannot follow a `307`/`308` redirect, exactly as on the network.
+  Before, the test transports read the body into memory first, which hid this.
+- With `ASGITransport` and `WSGITransport`, `request.content` is empty for a streamed
+  body; read `request.stream` instead. `MockTransport` still reads the body into
+  `request.content`.
+- A WebSocket handshake that is refused while a `DigestAuth` (or another flow-based
+  auth) is configured used to be sent without credentials; it is now authenticated.
+- CI: the Windows job is required, and the workflows use Node 24 versions of the
+  GitHub actions.
+
+### Still not supported
+
+See "Limitations" in the README: HTTP/3 needs a custom build, there is no
+NTLM/Negotiate auth, and `max_connections` counts connections in use.
+
 ## 0.2.0 - 2026-11-20
 
 This release removes most of the limitations listed for 0.1.

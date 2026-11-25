@@ -17,7 +17,15 @@ import os
 import re
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Generator, Iterable, Iterator, Mapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Generator,
+    Iterable,
+    Iterator,
+    Mapping,
+)
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypedDict, TypeVar, Union, overload
 
 from . import _nextreq
@@ -142,13 +150,23 @@ class RequestOptions(TypedDict, total=False):
 
 
 class Transport(Protocol):
-    """A synchronous transport: turns a :class:`Request` into a :class:`Response`."""
+    """A synchronous transport: turns a :class:`Request` into a :class:`Response`.
+
+    A request whose body is streamed (``request.stream`` is set) is read into
+    ``request.content`` before the transport sees it. A transport that wants
+    the stream itself sets the class attribute ``streams_requests = True`` and
+    consumes ``request.stream.open()``.
+    """
 
     def handle_request(self, request: Request) -> Response: ...
 
 
 class AsyncTransport(Protocol):
-    """An asynchronous transport."""
+    """An asynchronous transport.
+
+    As for :class:`Transport`, set ``streams_requests = True`` to receive
+    streamed request bodies as a stream (``request.stream.aopen()``).
+    """
 
     async def handle_async_request(self, request: Request) -> Response: ...
 
@@ -273,7 +291,12 @@ class DigestAuth(Auth):
     authenticate straight away.
 
     Supports the ``MD5``, ``SHA``, ``SHA-256``, ``SHA-512`` and ``SHA-512-256``
-    algorithms and their ``-sess`` variants, with ``qop=auth``.
+    algorithms and their ``-sess`` variants, with ``qop=auth`` and
+    ``qop=auth-int``.
+
+    ``auth-int`` also signs the request body, and is used only when the server
+    offers nothing else. The body is hashed before it is sent, so it has to be
+    in memory, a seekable file or a re-iterable object (not a generator).
     """
 
     def __init__(self, username: str | bytes, password: str | bytes) -> None:
@@ -328,10 +351,15 @@ class DigestAuth(Auth):
 
         qop_options = [option.strip().lower() for option in challenge.get("qop", "").split(",")]
         qop_options = [option for option in qop_options if option]
-        if qop_options and "auth" not in qop_options:
+        qop: str | None = None
+        if "auth" in qop_options:
+            qop = "auth"
+        elif "auth-int" in qop_options:
+            qop = "auth-int"
+        elif qop_options:
             raise LocalProtocolError(
                 f"unsupported Digest auth quality of protection {challenge.get('qop')!r} "
-                '(only "auth" is supported)'
+                '(expected "auth" or "auth-int")'
             )
         realm = challenge.get("realm", "")
         nonce = challenge["nonce"]
@@ -344,9 +372,13 @@ class DigestAuth(Auth):
         ha1 = digest(b":".join((self._username, realm.encode("utf-8"), self._password)))
         if session:
             ha1 = digest(f"{ha1}:{nonce}:{cnonce}".encode())
-        ha2 = digest(f"{request.method}:{uri}".encode())
-        if qop_options:
-            response = digest(f"{ha1}:{nonce}:{nonce_count}:{cnonce}:auth:{ha2}".encode())
+        if qop == "auth-int":
+            body_hash = self._body_hash(request, hash_name)
+            ha2 = digest(f"{request.method}:{uri}:{body_hash}".encode())
+        else:
+            ha2 = digest(f"{request.method}:{uri}".encode())
+        if qop is not None:
+            response = digest(f"{ha1}:{nonce}:{nonce_count}:{cnonce}:{qop}:{ha2}".encode())
         else:  # RFC 2069
             response = digest(f"{ha1}:{nonce}:{ha2}".encode())
 
@@ -361,9 +393,27 @@ class DigestAuth(Auth):
             fields.append(f"algorithm={algorithm}")
         if "opaque" in challenge:
             fields.append(f"opaque={_quote_auth_value(challenge['opaque'])}")
-        if qop_options:
-            fields.extend(("qop=auth", f"nc={nonce_count}", f'cnonce="{cnonce}"'))
+        if qop is not None:
+            fields.extend((f"qop={qop}", f"nc={nonce_count}", f'cnonce="{cnonce}"'))
         return "Digest " + ", ".join(fields)
+
+    @staticmethod
+    def _body_hash(request: Request, hash_name: str) -> str:
+        """The hash of the request body, which ``qop=auth-int`` signs."""
+        hasher = hashlib.new(hash_name)
+        stream = request.stream
+        if stream is None:
+            hasher.update(request.content)
+        elif stream.is_async or not stream.replayable:
+            raise LocalProtocolError(
+                "Digest auth with qop=auth-int signs the request body, so the body is "
+                "needed before it is sent, and this one is a one-shot or async stream. "
+                "Pass bytes, a seekable file or a re-iterable object instead."
+            )
+        else:
+            for chunk in stream.open():  # read once here, replayed when it is sent
+                hasher.update(chunk)
+        return hasher.hexdigest()
 
 
 def _coerce_auth(auth: AuthTypes) -> Callable[[Request], Any] | None:
@@ -794,27 +844,48 @@ class _BaseClient:
         return f"<{type(self).__name__}{base}>"
 
 
+_WebSocketRefusal = tuple[int, list[tuple[str, str]], bytes]
+
+
 def _websocket_handshake(
     client: _BaseClient,
     url: URLTypes,
     headers: HeaderTypes | None,
     auth: AuthTypes | _Unset,
     timeout: TimeoutTypes | _Unset,
-) -> tuple[str, list[tuple[str, str]], Timeout | None]:
-    """Build the URL, headers and timeout of a WebSocket handshake."""
+) -> Request:
+    """The handshake of a WebSocket connection: a GET for a ``ws(s)://`` URL."""
     request = client.build_request("GET", url, headers=headers, auth=auth, timeout=timeout)
     target = str(request.url)
     if target.startswith("http://"):
-        target = "ws://" + target[7:]
+        request.url = URL("ws://" + target[7:])
     elif target.startswith("https://"):
-        target = "wss://" + target[8:]
+        request.url = URL("wss://" + target[8:])
+    return request
+
+
+def _handshake_headers(client: _BaseClient, request: Request) -> list[tuple[str, str]]:
+    """The headers to send with a handshake, read again for every attempt."""
     if client._cookies._jar or request._cookie_base is not None:
-        request.url = URL(target)
         client._apply_cookies(request)
-    handshake_headers = [
-        item for item in request.headers._list if item[0] not in ("accept", "accept-encoding")
-    ]
-    return target, handshake_headers, _prepared_timeout(request)
+    return [item for item in request.headers._list if item[0] not in ("accept", "accept-encoding")]
+
+
+def _handshake_refused(request: Request, refusal: _WebSocketRefusal) -> Response:
+    status, headers, body = refusal
+    return Response(status, headers=headers, content=body, request=request)
+
+
+def _handshake_error(response: Response) -> WebSocketError:
+    return WebSocketError(
+        f"WebSocket handshake failed: server responded with HTTP {response.status_code}",
+        request=response.request,
+        response=response,
+    )
+
+
+def _flow_ended_early() -> WebSocketError:
+    return WebSocketError("The auth flow ended without sending the WebSocket handshake.")
 
 
 def _prepared_timeout(request: Request) -> Timeout | None:
@@ -993,8 +1064,10 @@ class Client(_BaseClient):
             else:
                 assert self._transport is not None
                 started = time.perf_counter()
-                if request.stream is not None:
-                    request.read()  # in-process transports take the body in one piece
+                if request.stream is not None and not getattr(
+                    self._transport, "streams_requests", False
+                ):
+                    request.read()  # this transport takes the body in one piece
                 response = self._transport.handle_request(request)
                 if response.request is None:
                     response.request = request
@@ -1286,22 +1359,63 @@ class Client(_BaseClient):
         The connection uses the client's TLS settings, proxies, cookies and
         default headers. ``compression=True`` offers permessage-deflate; check
         ``ws.compressed`` to see whether the server accepted it.
+
+        ``auth`` applies to the handshake, including schemes that answer a
+        challenge (``DigestAuth``, or your own ``auth_flow``). A handshake the
+        server refuses raises :class:`WebSocketError` with the server's answer
+        in ``.response``.
         """
         self._check_open()
-        if self._raw is None:
+        raw = self._raw
+        if raw is None:
             raise WebSocketError("WebSockets are not supported with a custom transport or `app`.")
-        target, handshake_headers, prepared_timeout = _websocket_handshake(
-            self, url, headers, auth, timeout
+        request = _websocket_handshake(self, url, headers, auth, timeout)
+        protocols = list(subprotocols) if subprotocols else None
+
+        def attempt(current: Request) -> WebSocketConnection | Response:
+            outcome = raw.ws_connect_blocking(
+                str(current.url),
+                _handshake_headers(self, current),
+                protocols,
+                _prepared_timeout(current),
+                max_message_size,
+                compression,
+            )
+            return _handshake_refused(current, outcome) if isinstance(outcome, tuple) else outcome
+
+        opened = (
+            attempt(request) if request._auth is None else self._authed_handshake(request, attempt)
         )
-        connection = self._raw.ws_connect_blocking(
-            target,
-            handshake_headers,
-            list(subprotocols) if subprotocols else None,
-            prepared_timeout,
-            max_message_size,
-            compression,
-        )
-        return SyncWebSocket(connection)
+        if isinstance(opened, Response):
+            raise _handshake_error(opened)
+        return SyncWebSocket(opened)
+
+    def _authed_handshake(
+        self, request: Request, attempt: Callable[[Request], WebSocketConnection | Response]
+    ) -> WebSocketConnection | Response:
+        """Open a WebSocket, letting the request's auth flow answer refusals."""
+        flow = request._auth.auth_flow(request)
+        try:
+            current = next(flow)
+            while True:
+                handshake = current.url.scheme in ("ws", "wss")
+                if handshake:
+                    answer = attempt(current)
+                    if not isinstance(answer, Response):
+                        return answer
+                else:  # a request of the flow's own, such as fetching a token
+                    if not current._prepared:
+                        current = self._prepare(current)
+                        current._auth = None
+                    answer = self._exchange(current, False)
+                try:
+                    current = flow.send(answer)
+                except StopIteration:
+                    if handshake:
+                        return answer  # the flow has no answer to this refusal
+                    raise _flow_ended_early() from None
+        finally:
+            flow.close()
 
     def close(self) -> None:
         """Close the client and its connection pool."""
@@ -1473,8 +1587,10 @@ class AsyncClient(_BaseClient):
             else:
                 assert self._transport is not None
                 started = time.perf_counter()
-                if request.stream is not None:
-                    await request.aread()  # in-process transports take the body in one piece
+                if request.stream is not None and not getattr(
+                    self._transport, "streams_requests", False
+                ):
+                    await request.aread()  # this transport takes the body in one piece
                 response = await self._transport.handle_async_request(request)
                 if response.request is None:
                     response.request = request
@@ -1895,31 +2011,52 @@ class AsyncClient(_BaseClient):
         The connection uses the client's TLS settings, proxies, cookies and
         default headers. ``compression=True`` offers permessage-deflate; check
         ``ws.compressed`` to see whether the server accepted it.
+
+        ``auth`` applies to the handshake, including schemes that answer a
+        challenge (``DigestAuth``, or your own ``auth_flow``). A handshake the
+        server refuses raises :class:`WebSocketError` with the server's answer
+        in ``.response``.
         """
-        engine, target, handshake_headers, prepared_timeout = self._websocket_request(
-            url, headers, auth, timeout
-        )
+        self._check_open()
+        if self._raw is None:
+            raise WebSocketError("WebSockets are not supported with a custom transport or `app`.")
         return _WebSocketConnector(
-            engine,
-            target,
-            handshake_headers,
+            self,
+            self._raw,
+            _websocket_handshake(self, url, headers, auth, timeout),
             list(subprotocols) if subprotocols else None,
-            prepared_timeout,
             max_message_size,
             compression,
         )
 
-    def _websocket_request(
+    async def _authed_handshake(
         self,
-        url: URLTypes,
-        headers: HeaderTypes | None,
-        auth: AuthTypes | _Unset,
-        timeout: TimeoutTypes | _Unset,
-    ) -> tuple[HttpClient, str, list[tuple[str, str]], Timeout | None]:
-        self._check_open()
-        if self._raw is None:
-            raise WebSocketError("WebSockets are not supported with a custom transport or `app`.")
-        return (self._raw, *_websocket_handshake(self, url, headers, auth, timeout))
+        request: Request,
+        attempt: Callable[[Request], Awaitable[WebSocketConnection | Response]],
+    ) -> WebSocketConnection | Response:
+        """Open a WebSocket, letting the request's auth flow answer refusals."""
+        flow = request._auth.auth_flow(request)
+        try:
+            current = next(flow)
+            while True:
+                handshake = current.url.scheme in ("ws", "wss")
+                if handshake:
+                    answer = await attempt(current)
+                    if not isinstance(answer, Response):
+                        return answer
+                else:  # a request of the flow's own, such as fetching a token
+                    if not current._prepared:
+                        current = self._prepare(current)
+                        current._auth = None
+                    answer = await self._exchange(current, False)
+                try:
+                    current = flow.send(answer)
+                except StopIteration:
+                    if handshake:
+                        return answer  # the flow has no answer to this refusal
+                    raise _flow_ended_early() from None
+        finally:
+            flow.close()
 
     async def aclose(self) -> None:
         """Close the client and its connection pool."""
@@ -2155,33 +2292,41 @@ class _WebSocketConnector:
 
     def __init__(
         self,
+        client: AsyncClient,
         engine: HttpClient,
-        url: str,
-        headers: list[tuple[str, str]],
+        request: Request,
         subprotocols: list[str] | None,
-        timeout: Timeout | None,
         max_message_size: int | None,
         compression: bool = False,
     ) -> None:
+        self._client = client
         self._engine = engine
-        self._url = url
-        self._headers = headers
+        self._request = request
         self._subprotocols = subprotocols
-        self._timeout = timeout
         self._max_message_size = max_message_size
         self._compression = compression
         self._socket: WebSocket | None = None
 
-    async def _connect(self) -> WebSocket:
-        connection = await self._engine.ws_connect(
-            self._url,
-            self._headers,
+    async def _attempt(self, request: Request) -> WebSocketConnection | Response:
+        outcome = await self._engine.ws_connect(
+            str(request.url),
+            _handshake_headers(self._client, request),
             self._subprotocols,
-            self._timeout,
+            _prepared_timeout(request),
             self._max_message_size,
             self._compression,
         )
-        self._socket = WebSocket(connection)
+        return _handshake_refused(request, outcome) if isinstance(outcome, tuple) else outcome
+
+    async def _connect(self) -> WebSocket:
+        request = self._request
+        if request._auth is None:
+            opened = await self._attempt(request)
+        else:
+            opened = await self._client._authed_handshake(request, self._attempt)
+        if isinstance(opened, Response):
+            raise _handshake_error(opened)
+        self._socket = WebSocket(opened)
         return self._socket
 
     def __await__(self) -> Generator[Any, None, WebSocket]:

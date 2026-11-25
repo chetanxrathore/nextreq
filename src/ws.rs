@@ -1,9 +1,10 @@
 //! WebSocket client.
 //!
 //! The connection is established here - TCP (optionally through an HTTP
-//! `CONNECT` or SOCKS5 proxy), TLS with the client's own rustls configuration,
-//! then the HTTP/1.1 upgrade - and the framing, including permessage-deflate
-//! (RFC 7692), is handled by `yawc`.
+//! `CONNECT` proxy, itself reached in the clear or over TLS, or a SOCKS5
+//! proxy), TLS with the client's own rustls configuration, then the HTTP/1.1
+//! upgrade - and the framing, including permessage-deflate (RFC 7692), is
+//! handled by `yawc`.
 //!
 //! Each connection is owned by one task (the *actor*). Handles talk to it over
 //! channels, so sending never waits for a receive in progress, every operation
@@ -20,7 +21,7 @@ use http::header::{
     HeaderName, HeaderValue, CONNECTION, HOST, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_EXTENSIONS,
     SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION, UPGRADE,
 };
-use http_body_util::Empty;
+use http_body_util::{BodyExt, Empty};
 use hyper_util::rt::TokioIo;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
@@ -48,6 +49,8 @@ const INCOMING_QUEUE: usize = 32;
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 /// Largest proxy `CONNECT` response head that is accepted.
 const MAX_PROXY_RESPONSE: usize = 16 * 1024;
+/// How much of the body of a refused handshake is kept for the caller.
+const MAX_REJECTION_BODY: usize = 64 * 1024;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 // ---------------------------------------------------------------------------
@@ -295,9 +298,38 @@ async fn tcp_connect(url: &Url) -> NxResult<TcpStream> {
     Ok(stream)
 }
 
-/// Open a tunnel to `target` through an HTTP proxy with `CONNECT`.
-async fn http_tunnel(proxy: &Url, target: &Url) -> NxResult<BoxIo> {
-    let mut stream = tcp_connect(proxy).await?;
+/// Wrap `stream` in TLS, verifying the certificate against the host of `url`.
+async fn tls_connect(url: &Url, stream: BoxIo, tls: Arc<rustls::ClientConfig>) -> NxResult<BoxIo> {
+    let host = url
+        .host_str()
+        .unwrap_or_default()
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_owned();
+    let server_name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| {
+        NxError::new(
+            ErrorKind::InvalidURL,
+            format!("invalid TLS server name {host:?}"),
+        )
+    })?;
+    let secured = tokio_rustls::TlsConnector::from(tls)
+        .connect(server_name, stream)
+        .await
+        .map_err(connect_error)?;
+    Ok(Box::new(secured))
+}
+
+/// Open a tunnel to `target` through an HTTP proxy with `CONNECT`. An
+/// `https://` proxy is spoken to over TLS; the tunnel then runs inside that
+/// TLS session.
+async fn http_tunnel(
+    proxy: &Url,
+    target: &Url,
+    tls: &Arc<rustls::ClientConfig>,
+) -> NxResult<BoxIo> {
+    let mut stream: BoxIo = Box::new(tcp_connect(proxy).await?);
+    if proxy.scheme() == "https" {
+        stream = tls_connect(proxy, stream, Arc::clone(tls)).await?;
+    }
     let destination = authority(target, true);
     let mut request = format!(
         "CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\nProxy-Connection: Keep-Alive\r\n"
@@ -346,7 +378,7 @@ async fn http_tunnel(proxy: &Url, target: &Url) -> NxResult<BoxIo> {
         .nth(1)
         .and_then(|code| code.parse::<u16>().ok());
     match status {
-        Some(code) if (200..300).contains(&code) => Ok(Box::new(stream)),
+        Some(code) if (200..300).contains(&code) => Ok(stream),
         Some(code) => Err(NxError::new(
             ErrorKind::ProxyError,
             format!("the proxy refused the tunnel to {destination}: HTTP {code}"),
@@ -366,7 +398,7 @@ async fn open_transport(
     let stream: BoxIo = match proxy {
         None => Box::new(tcp_connect(url).await?),
         Some(proxy) => match proxy.scheme() {
-            "http" => http_tunnel(proxy, url).await?,
+            "http" | "https" => http_tunnel(proxy, url, &tls).await?,
             "socks5" | "socks5h" => {
                 let socks = yawc::Proxy::socks5(proxy.clone())
                     .map_err(|e| NxError::new(ErrorKind::ProxyError, chain_message(&e)))?;
@@ -382,7 +414,7 @@ async fn open_transport(
                     ErrorKind::ProxyError,
                     format!(
                         "unsupported proxy scheme {other:?} for WebSocket connections \
-                         (expected http, socks5 or socks5h)"
+                         (expected http, https, socks5 or socks5h)"
                     ),
                 ))
             }
@@ -391,22 +423,7 @@ async fn open_transport(
     if url.scheme() != "wss" {
         return Ok(stream);
     }
-    let host = url
-        .host_str()
-        .unwrap_or_default()
-        .trim_matches(|c| c == '[' || c == ']')
-        .to_owned();
-    let server_name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| {
-        NxError::new(
-            ErrorKind::InvalidURL,
-            format!("invalid TLS server name {host:?}"),
-        )
-    })?;
-    let secured = tokio_rustls::TlsConnector::from(tls)
-        .connect(server_name, stream)
-        .await
-        .map_err(connect_error)?;
-    Ok(Box::new(secured))
+    tls_connect(url, stream, tls).await
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +443,48 @@ pub struct ConnectOptions {
     pub compression: bool,
 }
 
+/// How an attempt to open a connection ended, short of an error.
+pub enum Opened {
+    Connected(WebSocketConnection),
+    /// The server answered the handshake with an ordinary HTTP response
+    /// (`401`, `403`, `404`, ...). Returned rather than raised, so that an
+    /// authentication flow can answer a challenge and try again.
+    Rejected {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
+}
+
+impl<'py> IntoPyObject<'py> for Opened {
+    type Target = PyAny;
+    type Output = Bound<'py, PyAny>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        match self {
+            Opened::Connected(connection) => connection.into_bound_py_any(py),
+            Opened::Rejected {
+                status,
+                headers,
+                body,
+            } => (status, headers, PyBytes::new(py, &body)).into_bound_py_any(py),
+        }
+    }
+}
+
+fn header_list(headers: &http::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect()
+}
+
 fn accept_key(key: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(key.as_bytes());
@@ -440,11 +499,7 @@ fn header_contains_token(value: Option<&HeaderValue>, token: &str) -> bool {
     })
 }
 
-async fn handshake(
-    options: &ConnectOptions,
-    url: &Url,
-    io: BoxIo,
-) -> NxResult<WebSocketConnection> {
+async fn handshake(options: &ConnectOptions, url: &Url, io: BoxIo) -> NxResult<Opened> {
     let mut nonce = [0u8; 16];
     nonce.iter_mut().for_each(|byte| *byte = fastrand::u8(..));
     let key = base64::engine::general_purpose::STANDARD.encode(nonce);
@@ -515,10 +570,26 @@ async fn handshake(
     let mut response = sender.send_request(request).await.map_err(connect_error)?;
 
     if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
-        return Err(ws_error(format!(
-            "WebSocket handshake failed: server responded with HTTP {}",
-            response.status().as_u16()
-        )));
+        let status = response.status().as_u16();
+        let headers = header_list(response.headers());
+        // Keep the start of the body: it usually says why.
+        let mut body = Vec::new();
+        while body.len() < MAX_REJECTION_BODY {
+            match response.body_mut().frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        let room = MAX_REJECTION_BODY - body.len();
+                        body.extend_from_slice(&data[..data.len().min(room)]);
+                    }
+                }
+                _ => break,
+            }
+        }
+        return Ok(Opened::Rejected {
+            status,
+            headers,
+            body,
+        });
     }
     let response_headers = response.headers();
     if !header_contains_token(response_headers.get(UPGRADE), "websocket")
@@ -561,15 +632,7 @@ async fn handshake(
             "WebSocket handshake failed: the server enabled an extension that was not offered",
         ));
     }
-    let header_list: Vec<(String, String)> = response_headers
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_owned(),
-                String::from_utf8_lossy(value.as_bytes()).into_owned(),
-            )
-        })
-        .collect();
+    let header_list = header_list(response_headers);
 
     let upgraded = hyper::upgrade::on(&mut response)
         .await
@@ -599,7 +662,7 @@ async fn handshake(
     let (command_tx, command_rx) = mpsc::channel(INCOMING_QUEUE);
     let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_QUEUE);
     tokio::spawn(run_connection(socket, command_rx, incoming_tx));
-    Ok(WebSocketConnection {
+    Ok(Opened::Connected(WebSocketConnection {
         shared: Arc::new(Shared {
             commands: command_tx,
             incoming: tokio::sync::Mutex::new(incoming_rx),
@@ -607,11 +670,12 @@ async fn handshake(
         subprotocol,
         response_headers: header_list,
         compressed,
-    })
+    }))
 }
 
-/// Open a WebSocket connection.
-pub async fn connect(options: ConnectOptions) -> NxResult<WebSocketConnection> {
+/// Open a WebSocket connection. A handshake the server refuses with an HTTP
+/// response is not an error here: see [`Opened::Rejected`].
+pub async fn connect(options: ConnectOptions) -> NxResult<Opened> {
     let url = Url::parse(&options.url).map_err(|e| {
         NxError::new(
             ErrorKind::InvalidURL,

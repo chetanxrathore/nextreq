@@ -28,8 +28,8 @@ jobs:
       matrix:
         target: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.ABI3_PYTHON }}
       - uses: PyO3/maturin-action@v1
@@ -38,7 +38,7 @@ jobs:
           manylinux: "2_28"
           args: --release --out dist
           sccache: "true"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-manylinux-${{ matrix.target }}
           path: dist
@@ -51,8 +51,8 @@ jobs:
       matrix:
         target: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.ABI3_PYTHON }}
       - uses: PyO3/maturin-action@v1
@@ -61,7 +61,7 @@ jobs:
           manylinux: musllinux_1_2
           args: --release --out dist
           sccache: "true"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-musllinux-${{ matrix.target }}
           path: dist
@@ -78,8 +78,8 @@ jobs:
       matrix:
         target: [aarch64, x86_64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.ABI3_PYTHON }}
       - uses: PyO3/maturin-action@v1
@@ -87,7 +87,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist
           sccache: "true"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-macos-${{ matrix.target }}
           path: dist
@@ -96,8 +96,8 @@ jobs:
     name: Windows x64
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.ABI3_PYTHON }}
           architecture: x64
@@ -106,7 +106,7 @@ jobs:
           target: x64
           args: --release --out dist
           sccache: "true"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-windows-x64
           path: dist
@@ -122,8 +122,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.14t"
       - uses: PyO3/maturin-action@v1
@@ -131,7 +131,7 @@ jobs:
           args: --release --out dist --interpreter python3.14t
           manylinux: "2_28"
           sccache: "true"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-cp314t-${{ matrix.os }}
           path: dist
@@ -140,12 +140,12 @@ jobs:
     name: sdist
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-sdist
           path: dist
@@ -160,10 +160,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.10", "3.14"]
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: wheels-*
           merge-multiple: true
@@ -182,7 +182,7 @@ jobs:
     permissions:
       id-token: write # trusted publishing + signing the provenance attestations
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: wheels-*
           merge-multiple: true

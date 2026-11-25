@@ -1936,7 +1936,8 @@ impl HttpClient {
         Ok(LoopBridge::spawn(bridge, future, execute(prepared, stream)))
     }
 
-    /// Open a WebSocket connection (awaitable).
+    /// Open a WebSocket connection (awaitable). A handshake the server refuses
+    /// with an HTTP response resolves to `(status, headers, body)`.
     #[pyo3(signature = (url, headers, subprotocols = None, timeout = None, max_message_size = None, compression = false))]
     #[allow(clippy::too_many_arguments)]
     fn ws_connect<'py>(
@@ -1964,6 +1965,7 @@ impl HttpClient {
     }
 
     /// Open a WebSocket connection, blocking the calling thread (GIL released).
+    /// A refused handshake is returned as `(status, headers, body)`.
     #[pyo3(signature = (url, headers, subprotocols = None, timeout = None, max_message_size = None, compression = false))]
     #[allow(clippy::too_many_arguments)]
     fn ws_connect_blocking<'py>(

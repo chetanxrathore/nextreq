@@ -23,12 +23,13 @@ import io
 import json as _json
 import re
 import sys
-from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Literal, Union
 from urllib.parse import parse_qsl, unquote, unquote_to_bytes
 
 from .exceptions import NextReqError
-from .models import Headers, HeaderTypes, Request, Response, SSEEvent
+from .models import UPLOAD_CHUNK_SIZE, Headers, HeaderTypes, Request, Response, SSEEvent
 
 if TYPE_CHECKING:
     from typing_extensions import Self
@@ -289,6 +290,8 @@ def _clone_response(response: Response) -> Response:
 
 
 class MockTransport(_CallAssertions):
+    # A streamed request body is read into ``request.content`` before matching,
+    # so that matchers, handlers and ``last_request`` can look at it.
     """An in-memory transport for tests.
 
     Register routes with :meth:`route` (or the ``get`` / ``post`` / ...
@@ -467,7 +470,16 @@ class WSGITransport:
     With ``client.stream(...)`` the application's response is consumed as it
     is produced, so streaming and Server-Sent Events endpoints can be tested
     chunk by chunk; closing the response closes the application's iterable.
+
+    A streamed request body (a generator or an open file) reaches the
+    application as a stream too: ``wsgi.input`` pulls it chunk by chunk.
+
+    With ``AsyncClient`` the application runs in a worker thread of its own
+    for as long as the response is open, and both bodies are still streamed.
     """
+
+    #: Streamed request bodies are passed on as a stream (see ``Transport``).
+    streams_requests = True
 
     def __init__(
         self,
@@ -487,7 +499,7 @@ class WSGITransport:
         self.script_name = script_name
         self.remote_addr = remote_addr
 
-    def _environ(self, request: Request) -> dict[str, Any]:
+    def _environ(self, request: Request, body: Iterator[bytes] | None) -> dict[str, Any]:
         url = request.url
         scheme = url.scheme or "http"
         port = url.effective_port or (443 if scheme == "https" else 80)
@@ -502,7 +514,11 @@ class WSGITransport:
             "REMOTE_ADDR": self.remote_addr,
             "wsgi.version": (1, 0),
             "wsgi.url_scheme": scheme,
-            "wsgi.input": io.BytesIO(request.content),
+            "wsgi.input": (
+                io.BytesIO(request.content)
+                if body is None
+                else io.BufferedReader(_ChunkReader(body), UPLOAD_CHUNK_SIZE)
+            ),
             "wsgi.errors": sys.stderr,
             "wsgi.multithread": True,
             "wsgi.multiprocess": False,
@@ -519,10 +535,28 @@ class WSGITransport:
             else:
                 environ["HTTP_" + name.upper().replace("-", "_")] = value
         environ.setdefault("HTTP_HOST", url.netloc or "testserver")
+        if body is not None and "CONTENT_LENGTH" not in environ:
+            # A body of unknown length ends where the stream ends (the flag
+            # servers set after decoding chunked transfer encoding).
+            environ["wsgi.input_terminated"] = True
         return environ
 
     def handle_request(self, request: Request) -> Response:
-        environ = self._environ(request)
+        stream = request.stream
+        started = self._start(request, None if stream is None else stream.open())
+        if started is None:
+            return Response(500, text="Internal Server Error", request=request)
+        status_code, headers, body = started
+        return Response(status_code, headers=headers, stream=body, request=request)
+
+    def _start(
+        self, request: Request, request_body: Iterator[bytes] | None
+    ) -> tuple[int, list[tuple[str, str]], _WSGIBody] | None:
+        """Call the application up to its first chunk; ``None`` for a hidden failure."""
+        upload_errors: list[Exception] = []
+        if request_body is not None:
+            request_body = _recording(request_body, upload_errors)
+        environ = self._environ(request, request_body)
         captured: dict[str, Any] = {}
         written: list[bytes] = []
 
@@ -546,9 +580,16 @@ class WSGITransport:
             first = next(chunks, None)
         except Exception:
             _close_quietly(result)
+            if upload_errors:
+                # The body could not be produced. A real client would drop the
+                # connection here, and the caller gets this error.
+                raise upload_errors[0] from None
             if self.raise_app_exceptions:
                 raise
-            return Response(500, text="Internal Server Error", request=request)
+            return None
+        if upload_errors:
+            _close_quietly(result)
+            raise upload_errors[0]
         if "status" not in captured:
             _close_quietly(result)
             raise RuntimeError("The WSGI application did not call start_response().")
@@ -556,20 +597,131 @@ class WSGITransport:
         # Legacy write() output comes first, then the iterable.
         ready = [*written, first] if first is not None else list(written)
         body = _WSGIBody(result, chunks, ready, written, self.raise_app_exceptions)
-        return Response(status_code, headers=captured["headers"], stream=body, request=request)
+        return status_code, captured["headers"], body
 
     async def handle_async_request(self, request: Request) -> Response:
-        """Run the (blocking) WSGI app in a worker thread, buffering its response."""
+        """Run the (blocking) WSGI app in a worker thread of its own.
 
-        def run() -> Response:
-            response = self.handle_request(request)
-            response.read()
-            return response
-
-        return await asyncio.get_running_loop().run_in_executor(None, run)
+        The thread lives as long as the response is open: the application is
+        called there, and each response chunk is produced there when the
+        client asks for it. The request body is produced on the event loop
+        and handed over chunk by chunk.
+        """
+        loop = asyncio.get_running_loop()
+        worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nextreq-wsgi")
+        stream = request.stream
+        request_body = None if stream is None else _iterate_from_thread(stream.aopen(), loop)
+        try:
+            started = await loop.run_in_executor(worker, self._start, request, request_body)
+        except BaseException:
+            worker.shutdown(wait=False)
+            raise
+        if started is None:
+            worker.shutdown(wait=False)
+            return Response(500, text="Internal Server Error", request=request)
+        status_code, headers, body = started
+        return Response(
+            status_code, headers=headers, stream=_ThreadedBody(body, worker), request=request
+        )
 
     def close(self) -> None:
         """Nothing to release."""
+
+
+def _recording(chunks: Iterator[bytes], errors: list[Exception]) -> Iterator[bytes]:
+    """Pass ``chunks`` through, noting the exception that ends them (if any)."""
+    try:
+        yield from chunks
+    except Exception as exc:
+        errors.append(exc)
+        raise
+
+
+class _ChunkReader(io.RawIOBase):
+    """``wsgi.input`` for a streamed request body: pulls chunks as they are read."""
+
+    def __init__(self, chunks: Iterator[bytes]) -> None:
+        self._chunks = chunks
+        self._pending = b""
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        while not self._pending:
+            try:
+                self._pending = next(self._chunks)
+            except StopIteration:
+                return 0
+        size = min(len(buffer), len(self._pending))
+        buffer[:size] = self._pending[:size]
+        self._pending = self._pending[size:]
+        return size
+
+
+def _iterate_from_thread(
+    chunks: AsyncIterator[bytes], loop: asyncio.AbstractEventLoop
+) -> Iterator[bytes]:
+    """Iterate, from a worker thread, over chunks produced on the event loop."""
+
+    async def pull() -> bytes | None:
+        try:
+            return await chunks.__anext__()
+        except StopAsyncIteration:
+            return None
+
+    while True:
+        chunk = asyncio.run_coroutine_threadsafe(pull(), loop).result()
+        if chunk is None:
+            return
+        yield chunk
+
+
+class _ThreadedBody:
+    """A WSGI response read from the event loop.
+
+    Every step runs on the one worker thread that called the application, so
+    the application sees a single thread for the whole request.
+    """
+
+    def __init__(self, body: _WSGIBody, worker: ThreadPoolExecutor) -> None:
+        self._body = body
+        self._chunks = iter(body)
+        self._worker = worker
+        self._done = False
+
+    def __aiter__(self) -> _ThreadedBody:
+        return self
+
+    async def __anext__(self) -> bytes:
+        if self._done:
+            raise StopAsyncIteration
+        loop = asyncio.get_running_loop()
+        try:
+            chunk = await loop.run_in_executor(self._worker, next, self._chunks, None)
+        except BaseException:
+            await self.aclose()
+            raise
+        if chunk is None:
+            self._done = True
+            self._worker.shutdown(wait=False)
+            raise StopAsyncIteration
+        return chunk
+
+    def _close(self) -> None:
+        self._chunks.close()  # type: ignore[attr-defined]
+        self._body.close()
+
+    async def aclose(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        loop = asyncio.get_running_loop()
+        try:
+            # Queued behind a chunk that is still being produced, if any.
+            await loop.run_in_executor(self._worker, self._close)
+        finally:
+            self._worker.shutdown(wait=False)
 
 
 def _close_quietly(result: Any) -> None:
@@ -657,7 +809,9 @@ class ASGITransport:
     **Streaming.** With ``client.stream(...)`` the response is delivered as the
     application sends it, with backpressure, so streaming and Server-Sent
     Events endpoints can be tested chunk by chunk. Closing the response tells
-    the application that the client disconnected.
+    the application that the client disconnected. A streamed request body (a
+    generator or an open file) is streamed too: the application receives one
+    ``http.request`` message per chunk, as it asks for them.
 
     **Lifespan.** The application's startup handlers run before the first
     request and its shutdown handlers when the client is closed, so use the
@@ -667,6 +821,9 @@ class ASGITransport:
     * ``True``: run them and raise if the application does not support them;
     * ``False``: never run them.
     """
+
+    #: Streamed request bodies are passed on as a stream (see ``AsyncTransport``).
+    streams_requests = True
 
     def __init__(
         self,
@@ -738,12 +895,28 @@ class ASGITransport:
         head: dict[str, Any] = {}
         request_delivered = False
         finished = False
+        upload = None if request.stream is None else request.stream.aopen()
+        upload_errors: list[Exception] = []
 
         async def receive() -> dict[str, Any]:
             nonlocal request_delivered
             if not request_delivered:
-                request_delivered = True
-                return {"type": "http.request", "body": request.content, "more_body": False}
+                if upload is None:
+                    request_delivered = True
+                    return {"type": "http.request", "body": request.content, "more_body": False}
+                try:
+                    chunk = await upload.__anext__()
+                except StopAsyncIteration:
+                    request_delivered = True
+                    return {"type": "http.request", "body": b"", "more_body": False}
+                except Exception as exc:
+                    # The body could not be produced. A real client would drop
+                    # the connection here, and the caller gets this error.
+                    request_delivered = True
+                    upload_errors.append(exc)
+                    disconnected.set()
+                    return {"type": "http.disconnect"}
+                return {"type": "http.request", "body": chunk, "more_body": True}
             await disconnected.wait()
             return {"type": "http.disconnect"}
 
@@ -789,19 +962,30 @@ class ASGITransport:
                     )
                 elif not finished:
                     await chunks.put(None)  # the app ended the response by returning
+            finally:
+                if upload is not None:
+                    with contextlib.suppress(Exception):
+                        await upload.aclose()
 
         task = loop.create_task(run_app())
         try:
             await started
         except RuntimeError:
+            if upload_errors:
+                raise upload_errors[0] from None
             raise
         except Exception:
+            if upload_errors:
+                raise upload_errors[0] from None
             if self.raise_app_exceptions:
                 raise
             return Response(500, text="Internal Server Error", request=request)
         except BaseException:
             task.cancel()
             raise
+        if upload_errors:
+            task.cancel()
+            raise upload_errors[0]
         body = _ASGIBody(task, chunks, disconnected, self.raise_app_exceptions)
         return Response(head["status"], headers=head["headers"], stream=body, request=request)
 

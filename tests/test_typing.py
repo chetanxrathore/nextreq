@@ -227,6 +227,10 @@ def _static_only(engine: HttpClient, stream: ResponseStream, ws: WebSocket) -> N
         Client(auth=nextreq.DigestAuth("user", "pass")).get("https://example.com"), Response
     )
 
+    # A refused WebSocket handshake carries the server's answer.
+    assert_type(nextreq.WebSocketError("refused").response, Response | None)
+    assert_type(nextreq.WSGITransport.streams_requests, bool)
+
     # Each of these must be a type error.
     nextreq.get("https://example.com", nonsense=True)  # type: ignore[call-overload]
     nextreq.get(42)  # type: ignore[call-overload]

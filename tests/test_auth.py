@@ -75,7 +75,13 @@ def test_digest_auth_algorithms(client: nextreq.Client, server: LiveServer, algo
         "/digest-auth/ada/s3cr3t pässword", params={"algorithm": algorithm}, auth=auth
     )
     assert response.status_code == 200
-    assert response.json() == {"authenticated": True, "nc": "00000001", "body": "", "user": "ada"}
+    assert response.json() == {
+        "authenticated": True,
+        "nc": "00000001",
+        "qop": "auth",
+        "body": "",
+        "user": "ada",
+    }
     assert server.digest_requests == 2  # the challenge, then the answer
 
 
@@ -124,7 +130,7 @@ def test_digest_auth_variants(client: nextreq.Client, server: LiveServer) -> Non
     ).json()["authenticated"]
     # Unsupported protection level / algorithm are reported, not silently skipped.
     with pytest.raises(nextreq.LocalProtocolError, match="quality of protection"):
-        client.get("/digest-auth/ada/pw", params={"qop": "auth-int"}, auth=DigestAuth("ada", "pw"))
+        client.get("/digest-auth/ada/pw", params={"qop": "auth-conf"}, auth=DigestAuth("ada", "pw"))
     with pytest.raises(nextreq.LocalProtocolError, match="algorithm"):
         client.get(
             "/digest-auth/ada/pw", params={"algorithm": "WHIRLPOOL"}, auth=DigestAuth("a", "p")
@@ -252,3 +258,65 @@ def test_plain_callables_and_simple_auth_classes_still_work(client: nextreq.Clie
             "GET", "https://api.test/items", headers={"Authorization": "Bearer fresh"}
         )
         assert mocked.send(request).status_code == 200
+
+
+def test_digest_auth_int_signs_the_body(client: nextreq.Client, tmp_path: Any) -> None:
+    only_int = {"qop": "auth-int"}
+    auth = DigestAuth("ada", "pw")
+    seen = client.post("/digest-auth/ada/pw", params=only_int, content=b"signed body", auth=auth)
+    assert seen.json() == {
+        "authenticated": True,
+        "nc": "00000001",
+        "qop": "auth-int",
+        "body": "signed body",
+        "user": "ada",
+    }
+    # No body at all, and SHA-256.
+    assert (
+        client.get(
+            "/digest-auth/ada/pw", params={**only_int, "algorithm": "SHA-256"}, auth=auth
+        ).json()["qop"]
+        == "auth-int"
+    )
+    # When the server offers both, the cheaper "auth" is used.
+    assert (
+        client.post(
+            "/digest-auth/ada/pw", params={"qop": "auth,auth-int"}, content=b"x", auth=auth
+        ).json()["qop"]
+        == "auth"
+    )
+
+    # Streamed bodies are hashed first and then replayed: a file ...
+    path = tmp_path / "payload.bin"
+    path.write_bytes(b"file body " * 20_000)
+    with path.open("rb") as handle:
+        seen = client.put("/digest-auth/ada/pw", params=only_int, content=handle, auth=auth)
+    assert seen.json()["qop"] == "auth-int" and len(seen.json()["body"]) == 200_000
+
+    class Reiterable:
+        def __iter__(self) -> Any:
+            yield b"part one, "
+            yield b"part two"
+
+    seen = client.put("/digest-auth/ada/pw", params=only_int, content=Reiterable(), auth=auth)
+    assert seen.json()["body"] == "part one, part two"
+
+    # ... but a body that can only be produced once cannot be signed in advance.
+    with pytest.raises(nextreq.LocalProtocolError, match="auth-int signs the request body"):
+        client.put("/digest-auth/ada/pw", params=only_int, content=iter([b"once"]), auth=auth)
+
+
+async def test_digest_auth_int_with_the_async_client(aclient: nextreq.AsyncClient) -> None:
+    auth = DigestAuth("ada", "pw")
+    seen = await aclient.post(
+        "/digest-auth/ada/pw", params={"qop": "auth-int"}, json={"n": 1}, auth=auth
+    )
+    assert seen.json()["qop"] == "auth-int" and seen.json()["body"] == '{"n":1}'
+
+    async def chunks() -> Any:
+        yield b"async"
+
+    with pytest.raises(nextreq.LocalProtocolError, match="auth-int signs the request body"):
+        await aclient.post(
+            "/digest-auth/ada/pw", params={"qop": "auth-int"}, content=chunks(), auth=auth
+        )

@@ -259,7 +259,12 @@ class HttpClient:
         timeout: Timeout | None = None,
         max_message_size: int | None = None,
         compression: bool = False,
-    ) -> Awaitable[WebSocketConnection]: ...
+    ) -> Awaitable[WebSocketConnection | tuple[int, list[tuple[str, str]], bytes]]:
+        """Open a WebSocket connection.
+
+        A handshake the server refuses with an HTTP response resolves to
+        ``(status, headers, body)`` instead of raising.
+        """
     def ws_connect_blocking(
         self,
         url: str,
@@ -268,7 +273,7 @@ class HttpClient:
         timeout: Timeout | None = None,
         max_message_size: int | None = None,
         compression: bool = False,
-    ) -> WebSocketConnection: ...
+    ) -> WebSocketConnection | tuple[int, list[tuple[str, str]], bytes]: ...
     def close(self) -> None: ...
     @property
     def is_closed(self) -> bool: ...

@@ -163,7 +163,23 @@ class TooManyRedirects(TransportError):
 
 
 class WebSocketError(TransportError):
-    """A WebSocket handshake or protocol failure."""
+    """A WebSocket handshake or protocol failure.
+
+    Attributes:
+        response: the server's answer when it refused the handshake with an
+            ordinary HTTP response (``401``, ``403``, ``404``, ...), so its
+            status, headers and body can be inspected; otherwise ``None``.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        request: Request | None = None,
+        response: Response | None = None,
+    ) -> None:
+        super().__init__(message, request=request)
+        self.response = response
 
 
 class WebSocketDisconnect(WebSocketError):

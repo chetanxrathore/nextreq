@@ -1050,3 +1050,282 @@ def test_wsgi_legacy_write_callable_and_late_start_response() -> None:
             "yes",
             b"late",
         )
+
+
+# -- streamed request bodies through the in-process transports ---------------------
+
+
+async def test_asgi_request_body_is_streamed_to_the_application() -> None:
+    produced: list[int] = []
+    seen: list[tuple[int, int, bool]] = []  # (chunk size, chunks produced so far, more_body)
+
+    async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        total = 0
+        while True:
+            message = await receive()
+            seen.append((len(message["body"]), len(produced), message["more_body"]))
+            total += len(message["body"])
+            if not message["more_body"]:
+                break
+        length = dict(scope["headers"]).get(b"content-length", b"unknown length")
+        body = f"{total} {length.decode()}".encode()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": body})
+
+    def body() -> Any:
+        for n in range(4):
+            produced.append(n)
+            yield b"x" * 1000
+
+    async with nextreq.AsyncClient(
+        transport=ASGITransport(app, lifespan=False), base_url="http://app"
+    ) as client:
+        response = await client.post("/", content=body())
+    assert response.text == "4000 unknown length"
+    # One message per chunk, each delivered before the next chunk was produced.
+    assert seen == [
+        (1000, 1, True),
+        (1000, 2, True),
+        (1000, 3, True),
+        (1000, 4, True),
+        (0, 4, False),
+    ]
+
+
+async def test_asgi_streams_files_async_generators_and_reports_body_errors(tmp_path: Any) -> None:
+    async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        size = 0
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            size += len(message["body"])
+            if not message["more_body"]:
+                break
+        length = dict(scope["headers"]).get(b"content-length", b"-").decode()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": f"{size} {length}".encode()})
+
+    path = tmp_path / "payload.bin"
+    path.write_bytes(b"f" * 200_000)
+
+    async def chunks() -> Any:
+        yield b"a" * 10
+        await asyncio.sleep(0)
+        yield b"b" * 20
+
+    async def broken() -> Any:
+        yield b"a"
+        raise ValueError("the source went away")
+
+    async with nextreq.AsyncClient(
+        transport=ASGITransport(app, lifespan=False), base_url="http://app"
+    ) as client:
+        with path.open("rb") as handle:
+            assert (await client.put("/", content=handle)).text == "200000 200000"
+        assert (await client.post("/", content=chunks())).text == "30 -"
+        with pytest.raises(ValueError, match="the source went away"):
+            await client.post("/", content=broken())
+        # An application that hides its errors still cannot hide a failed upload.
+    hidden = ASGITransport(app, raise_app_exceptions=False, lifespan=False)
+    async with nextreq.AsyncClient(transport=hidden, base_url="http://app") as client:
+        with pytest.raises(ValueError, match="the source went away"):
+            await client.post("/", content=broken())
+
+
+async def test_asgi_streamed_bodies_are_replayed_or_refused_like_on_the_network() -> None:
+    attempts: list[bytes] = []
+
+    async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        body = b""
+        while True:
+            message = await receive()
+            body += message["body"]
+            if not message["more_body"]:
+                break
+        attempts.append(body)
+        status = 503 if len(attempts) == 1 else 200
+        await send({"type": "http.response.start", "status": status, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    class Reiterable:
+        def __iter__(self) -> Any:
+            yield b"part-1;"
+            yield b"part-2;"
+
+    policy = nextreq.RetryPolicy(max_attempts=2, backoff_factor=0.0)
+    async with nextreq.AsyncClient(
+        transport=ASGITransport(app, lifespan=False), base_url="http://app"
+    ) as client:
+        response = await client.put("/", content=Reiterable(), retries=policy)
+        assert (response.status_code, response.retry_count) == (200, 1)
+        assert attempts == [b"part-1;part-2;"] * 2
+
+        attempts.clear()  # a generator can only be sent once, so it is not retried
+        response = await client.put("/", content=iter([b"once"]), retries=policy)
+        assert (response.status_code, response.retry_count) == (503, 0)
+
+
+def test_wsgi_request_body_is_pulled_through_wsgi_input(tmp_path: Any) -> None:
+    produced: list[int] = []
+    progress: list[int] = []
+
+    def app(environ: dict[str, Any], start_response: Any) -> Any:
+        stream = environ["wsgi.input"]
+        first = stream.read(10)
+        progress.append(len(produced))  # how much of the body existed at that point
+        rest = stream.read()
+        summary = "{} {} {}".format(
+            len(first) + len(rest),
+            environ.get("CONTENT_LENGTH", "-"),
+            environ.get("wsgi.input_terminated", False),
+        )
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [summary.encode()]
+
+    def body() -> Any:
+        for n in range(5):
+            produced.append(n)
+            yield b"y" * 100
+
+    path = tmp_path / "payload.bin"
+    path.write_bytes(b"line one\nline two\n" + b"z" * 150_000)
+
+    def lines(environ: dict[str, Any], start_response: Any) -> Any:
+        stream = environ["wsgi.input"]
+        start_response("200 OK", [])
+        return [stream.readline(), b"|", stream.readline(), b"|", str(len(stream.read())).encode()]
+
+    with nextreq.Client(app=app, base_url="http://app") as client:
+        assert client.post("/", content=body()).text == "500 - True"
+        assert progress == [1]  # only the first chunk had been produced
+        with path.open("rb") as handle:
+            assert client.put("/", content=handle).text == f"{path.stat().st_size} 150018 False"
+        assert client.post("/", content=b"in memory").text == "9 9 False"
+    with nextreq.Client(app=lines, base_url="http://app") as client, path.open("rb") as handle:
+        assert client.put("/", content=handle).text == "line one\n|line two\n|150000"
+
+
+async def test_wsgi_application_is_streamed_through_the_async_client() -> None:
+    import threading
+
+    produced: list[int] = []
+    closed: list[bool] = []
+    threads: set[int] = set()
+    bodies: list[bytes] = []
+
+    def app(environ: dict[str, Any], start_response: Any) -> Any:
+        threads.add(threading.get_ident())
+        bodies.append(environ["wsgi.input"].read())
+
+        def generate() -> Any:
+            try:
+                for n in range(1000):
+                    threads.add(threading.get_ident())
+                    produced.append(n)
+                    yield f"chunk-{n}\n".encode()
+            finally:
+                threads.add(threading.get_ident())
+                closed.append(True)
+
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return generate()
+
+    async def upload() -> Any:
+        yield b"from the "
+        await asyncio.sleep(0)
+        yield b"event loop"
+
+    async with nextreq.AsyncClient(transport=WSGITransport(app), base_url="http://app") as client:
+        async with client.stream("POST", "/", content=upload()) as response:
+            assert response.status_code == 200
+            chunks = response.aiter_bytes()
+            assert await chunks.__anext__() == b"chunk-0\n"
+            assert await chunks.__anext__() == b"chunk-1\n"
+            assert len(produced) <= 3  # nothing was generated ahead of the reader
+        assert closed == [True]  # leaving the block closed the application's iterable
+        assert bodies == [b"from the event loop"]
+        # The application ran on one thread of its own, never on the event loop.
+        assert len(threads) == 1 and threading.get_ident() not in threads
+
+        produced.clear()
+        threads.clear()
+        response = await client.get("/")  # buffered: read to the end
+        assert response.text.count("chunk-") == 1000
+        assert len(threads) == 1
+
+        # Many requests at once, each on its own worker thread.
+        responses = await client.gather(["/"] * 8, max_concurrency=8)
+        assert all(r.text.count("chunk-") == 1000 for r in responses)
+
+
+async def test_wsgi_errors_through_the_async_client() -> None:
+    def failing(environ: dict[str, Any], start_response: Any) -> Any:
+        raise RuntimeError("wsgi exploded")
+
+    def failing_late(environ: dict[str, Any], start_response: Any) -> Any:
+        def generate() -> Any:
+            yield b"first"
+            raise RuntimeError("wsgi exploded late")
+
+        start_response("200 OK", [])
+        return generate()
+
+    async with nextreq.AsyncClient(
+        transport=WSGITransport(failing), base_url="http://app"
+    ) as client:
+        with pytest.raises(RuntimeError, match="wsgi exploded"):
+            await client.get("/")
+    quiet = WSGITransport(failing, raise_app_exceptions=False)
+    async with nextreq.AsyncClient(transport=quiet, base_url="http://app") as client:
+        assert (await client.get("/")).status_code == 500
+
+    # A request body that cannot be produced is the caller's error, not the
+    # application's: it is raised even when application errors are hidden.
+    def reads_everything(environ: dict[str, Any], start_response: Any) -> Any:
+        try:
+            body = environ["wsgi.input"].read()
+        except ValueError:
+            body = b"the application swallowed the error"
+        start_response("200 OK", [])
+        return [body]
+
+    def broken() -> Any:
+        yield b"a"
+        raise ValueError("the source went away")
+
+    async def broken_async() -> Any:
+        yield b"a"
+        raise ValueError("the async source went away")
+
+    hidden = WSGITransport(reads_everything, raise_app_exceptions=False)
+    with nextreq.Client(transport=hidden, base_url="http://app") as sync_client:
+        with pytest.raises(ValueError, match="the source went away"):
+            sync_client.post("/", content=broken())
+        assert sync_client.post("/", content=iter([b"fine"])).content == b"fine"
+    async with nextreq.AsyncClient(transport=hidden, base_url="http://app") as client:
+        with pytest.raises(ValueError, match="the async source went away"):
+            await client.post("/", content=broken_async())
+    async with nextreq.AsyncClient(
+        transport=WSGITransport(failing_late), base_url="http://app"
+    ) as client:
+        with pytest.raises(RuntimeError, match="wsgi exploded late"):
+            await client.get("/")
+
+
+def test_custom_transports_choose_whether_to_receive_a_stream() -> None:
+    class Buffered:
+        def handle_request(self, request: Request) -> Response:
+            return Response(200, text=f"{request.stream is None} {request.content!r}")
+
+    class Streaming:
+        streams_requests = True
+
+        def handle_request(self, request: Request) -> Response:
+            assert request.stream is not None and request.content == b""
+            return Response(200, content=b"|".join(request.stream.open()))
+
+    with nextreq.Client(transport=Buffered()) as client:
+        assert client.post("http://x/", content=iter([b"a", b"b"])).text == "True b'ab'"
+    with nextreq.Client(transport=Streaming()) as client:
+        assert client.post("http://x/", content=iter([b"a", b"b"])).content == b"a|b"

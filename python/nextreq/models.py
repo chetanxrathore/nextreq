@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import codecs
 import dataclasses
 import datetime
 import enum
 import io
+import itertools
 import json as _json
 import mimetypes
 import os
@@ -14,6 +16,7 @@ import re
 import stat
 import time
 from collections.abc import (
+    AsyncGenerator,
     AsyncIterable,
     AsyncIterator,
     Iterable,
@@ -738,6 +741,15 @@ class _FilePart:
             yield chunk
 
 
+#: File chunks read per trip to a worker thread when a file is uploaded by
+#: ``AsyncClient`` (the event loop never waits for the disk).
+_ASYNC_FILE_BATCH: Final = 16
+
+
+def _take(chunks: Iterator[bytes], count: int) -> list[bytes]:
+    return list(itertools.islice(chunks, count))
+
+
 def _checked_chunk(chunk: Any) -> bytes:
     if isinstance(chunk, bytes):
         return chunk
@@ -827,16 +839,36 @@ class RequestStream:
             else:
                 yield from part.chunks(rewind)
 
-    async def aopen(self) -> AsyncIterator[bytes]:
-        """Async twin of :meth:`open`; also accepts async iterables."""
-        if not self.is_async:
+    async def aopen(self) -> AsyncGenerator[bytes, None]:
+        """Async twin of :meth:`open`; also accepts async iterables.
+
+        Files are read in a worker thread, a few chunks per trip, so a slow
+        disk does not stall the event loop. A plain iterable is your own code
+        and runs on the event loop.
+        """
+        if self.is_async:
+            self._begin()
+            async for chunk in self._source:
+                if chunk:
+                    yield _checked_chunk(chunk)
+            return
+        if self._parts is None:
             for chunk in self.open():
                 yield chunk
             return
-        self._begin()
-        async for chunk in self._source:
-            if chunk:
-                yield _checked_chunk(chunk)
+        replay = self._begin()
+        loop = asyncio.get_running_loop()
+        for part in self._parts:
+            if isinstance(part, bytes):
+                yield part
+                continue
+            chunks = part.chunks(replay)
+            while True:
+                batch = await loop.run_in_executor(None, _take, chunks, _ASYNC_FILE_BATCH)
+                for chunk in batch:
+                    yield chunk
+                if len(batch) < _ASYNC_FILE_BATCH:
+                    break
 
     def read(self) -> bytes:
         """Produce the whole body in memory."""

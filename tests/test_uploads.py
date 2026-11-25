@@ -385,3 +385,42 @@ async def test_async_in_process_transport_receives_the_whole_body() -> None:
     async with nextreq.AsyncClient(transport=mock) as client:
         await client.post("https://api.test/items", content=body())
     assert seen["content"] == b"part one, part two"
+
+
+async def test_async_client_reads_files_off_the_event_loop(
+    aclient: nextreq.AsyncClient, big_file: Path
+) -> None:
+    import threading
+
+    readers: set[int] = set()
+
+    class SlowFile(io.FileIO):
+        def read(self, size: int | None = -1) -> bytes:
+            readers.add(threading.get_ident())
+            time.sleep(0.005)  # a slow disk
+            return super().read(size)
+
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.001)
+
+    heartbeat = asyncio.ensure_future(ticker())
+    try:
+        with SlowFile(big_file, "rb") as handle:
+            seen = (await aclient.put("/digest", content=handle)).json()
+        assert seen["sha256"] == _digest(big_file.read_bytes())
+        assert seen["content_length"] == str(big_file.stat().st_size)
+        assert readers and threading.get_ident() not in readers
+        assert ticks >= 5  # the loop kept running while the file was being read
+
+        readers.clear()
+        with SlowFile(big_file, "rb") as handle:  # multipart: the file part is read the same way
+            seen = (await aclient.post("/upload", files={"f": ("f.bin", handle)})).json()
+        assert seen["files"]["f"]["size"] == big_file.stat().st_size
+        assert readers and threading.get_ident() not in readers
+    finally:
+        heartbeat.cancel()

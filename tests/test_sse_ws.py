@@ -8,6 +8,7 @@ import json
 import pickle
 import threading
 import time
+from typing import Any
 
 import pytest
 
@@ -609,3 +610,119 @@ def test_sync_websocket_errors(client: nextreq.Client, unused_port: int) -> None
     with nextreq.Client(transport=nextreq.MockTransport()) as mocked:
         with pytest.raises(nextreq.WebSocketError, match="custom transport"):
             mocked.websocket("ws://example.com/ws")
+
+
+# -- WebSockets: TLS proxies, refused handshakes and authentication ---------------
+
+
+def test_sync_websocket_through_an_https_proxy(
+    server: LiveServer, tls_server: TLSServer, tls_proxy: ProxyServer
+) -> None:
+    """TLS to the proxy, CONNECT inside it, then (for wss) TLS to the origin inside that."""
+    assert tls_proxy.url.startswith("https://")
+    with nextreq.Client(verify=tls_server.ca_path, proxy=tls_proxy.url, trust_env=False) as client:
+        with client.websocket(f"wss://localhost:{tls_server.port}/ws-echo") as ws:
+            ws.send_text("tls in tls")
+            assert ws.receive() == "tls:tls in tls"
+        with client.websocket(f"{server.ws_url}/ws") as ws:
+            ws.send_text("plain inside tls")
+            assert ws.receive() == "echo:plain inside tls"
+    assert tls_proxy.requests == [
+        f"CONNECT localhost:{tls_server.port}",
+        f"CONNECT 127.0.0.1:{server.port}",
+    ]
+
+
+async def test_websocket_through_an_https_proxy(
+    server: LiveServer, tls_server: TLSServer, tls_proxy: ProxyServer
+) -> None:
+    proxy_url = tls_proxy.url.replace("https://", "https://user:secret@")
+    async with nextreq.AsyncClient(
+        verify=tls_server.ca_path, proxy=proxy_url, trust_env=False
+    ) as client:
+        async with client.websocket(f"wss://localhost:{tls_server.port}/ws-echo") as ws:
+            await ws.send_text("async tls in tls")
+            assert await ws.receive() == "tls:async tls in tls"
+    assert tls_proxy.last_headers["proxy-authorization"] == "Basic dXNlcjpzZWNyZXQ="
+
+    # The proxy's own certificate is verified like any other.
+    async with nextreq.AsyncClient(proxy=tls_proxy.url, trust_env=False) as client:
+        with pytest.raises(nextreq.ConnectError):
+            async with client.websocket(f"{server.ws_url}/ws"):
+                pass
+
+
+async def test_websocket_refusal_carries_the_response(aclient: nextreq.AsyncClient) -> None:
+    with pytest.raises(nextreq.WebSocketError, match="HTTP 404") as refused:
+        async with aclient.websocket("/no-such-endpoint"):
+            pass
+    response = refused.value.response
+    assert response is not None and response.status_code == 404
+    assert refused.value.request is not None and refused.value.request.url.scheme == "ws"
+
+    with pytest.raises(nextreq.WebSocketError, match="HTTP 401") as denied:
+        async with aclient.websocket("/ws-digest/ada/secret"):
+            pass
+    response = denied.value.response
+    assert response is not None
+    assert response.json() == {"authenticated": False}
+    assert response.headers["www-authenticate"].startswith("Digest ")
+
+
+async def test_websocket_digest_auth(aclient: nextreq.AsyncClient, server: LiveServer) -> None:
+    auth = nextreq.DigestAuth("ada", "secret")
+    async with aclient.websocket("/ws-digest/ada/secret", auth=auth) as ws:
+        assert await ws.receive() == "authenticated"
+        await ws.send_text("hi")
+        assert await ws.receive() == "echo:hi"
+    assert server.digest_requests == 2  # the challenge, then the answer
+
+    # The challenge is remembered: the next handshake authenticates straight away.
+    async with aclient.websocket("/ws-digest/ada/secret?x=1", auth=auth) as ws:
+        assert await ws.receive() == "authenticated"
+    assert server.digest_requests == 3
+
+    with pytest.raises(nextreq.WebSocketError, match="HTTP 401") as denied:
+        async with aclient.websocket(
+            "/ws-digest/ada/secret", auth=nextreq.DigestAuth("ada", "wrong")
+        ):
+            pass
+    assert denied.value.response is not None and denied.value.response.status_code == 401
+
+
+def test_sync_websocket_digest_auth_from_the_client(server: LiveServer) -> None:
+    with nextreq.Client(base_url=server.url, auth=nextreq.DigestAuth("ada", "secret")) as client:
+        with client.websocket("/ws-digest/ada/secret") as ws:
+            assert ws.receive() == "authenticated"
+        # The same credentials serve plain requests on the same client.
+        assert client.get("/digest-auth/ada/secret").json()["authenticated"] is True
+        with pytest.raises(nextreq.WebSocketError, match="HTTP 401"):
+            client.websocket("/ws-digest/ada/other-password")
+
+
+async def test_websocket_auth_flow_with_its_own_requests(
+    aclient: nextreq.AsyncClient, server: LiveServer
+) -> None:
+    class TokenAuth(nextreq.Auth):
+        """Fetches a token over HTTP before the handshake."""
+
+        def auth_flow(self, request: nextreq.Request) -> Any:
+            fetched = yield nextreq.Request("POST", f"{server.url}/echo", json={"token": "t0k3n"})
+            token = fetched.json()["json"]["token"]
+            request.headers["authorization"] = f"Bearer {token}"
+            yield request
+
+    class GivesUp(nextreq.Auth):
+        def auth_flow(self, request: nextreq.Request) -> Any:
+            yield nextreq.Request("GET", f"{server.url}/json")
+
+    async with aclient.websocket("/ws-headers", auth=TokenAuth()) as ws:
+        assert (await ws.receive_json())["authorization"] == "Bearer t0k3n"
+    with nextreq.Client(base_url=server.url) as client:
+        with client.websocket("/ws-headers", auth=TokenAuth()) as sync_ws:
+            assert sync_ws.receive_json()["authorization"] == "Bearer t0k3n"
+        with pytest.raises(nextreq.WebSocketError, match="auth flow ended"):
+            client.websocket("/ws-headers", auth=GivesUp())
+    with pytest.raises(nextreq.WebSocketError, match="auth flow ended"):
+        async with aclient.websocket("/ws-headers", auth=GivesUp()):
+            pass

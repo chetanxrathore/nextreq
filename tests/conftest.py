@@ -16,6 +16,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import threading
 import zlib
 from collections import Counter
@@ -169,6 +170,7 @@ class LiveServer:
         r.add_get("/ws-headers", self.ws_headers)
         r.add_get("/ws-heartbeat", self.ws_heartbeat)
         r.add_get("/ws-close", self.ws_close)
+        r.add_get("/ws-digest/{user}/{password}", self.ws_digest)
         return app
 
     async def json_(self, request: web.Request) -> web.Response:
@@ -394,7 +396,8 @@ class LiveServer:
         """A Digest-protected resource (RFC 7616), verified independently of the client.
 
         Query: ``algorithm`` (default MD5), ``qop`` (default ``auth``; empty for
-        RFC 2069), ``expire=1`` (every nonce is accepted only once, then stale),
+        RFC 2069; ``auth-int`` also signs the body), ``expire=1`` (every nonce is
+        accepted only once, then stale),
         ``extra=1`` (also offer Basic in the same header).
         """
         self.digest_requests += 1
@@ -438,6 +441,11 @@ class LiveServer:
         if algorithm.upper().endswith("-SESS"):
             ha1 = digest(f"{ha1}:{nonce}:{given.get('cnonce', '')}")
         ha2 = digest(f"{request.method}:{given.get('uri', '')}")
+        if qop and given.get("qop") not in [option.strip() for option in qop.split(",")]:
+            return challenge()  # a quality of protection that was not offered
+        if given.get("qop") == "auth-int":
+            body_hash = hashlib.new(hash_name, body).hexdigest()
+            ha2 = digest(f"{request.method}:{given.get('uri', '')}:{body_hash}")
         if qop:
             count = int(given.get("nc", "0"), 16)
             if count <= self.digest_nonces[nonce]:
@@ -458,7 +466,13 @@ class LiveServer:
         if "expire" in request.query:
             del self.digest_nonces[nonce]
         return web.json_response(
-            {"authenticated": True, "nc": given.get("nc"), "body": body.decode(), "user": user}
+            {
+                "authenticated": True,
+                "nc": given.get("nc"),
+                "qop": given.get("qop"),
+                "body": body.decode("latin-1"),
+                "user": user,
+            }
         )
 
     async def basic_auth(self, request: web.Request) -> web.Response:
@@ -535,6 +549,19 @@ class LiveServer:
         await socket_.prepare(request)
         await socket_.send_json({k.lower(): v for k, v in request.headers.items()})
         await socket_.close()
+        return socket_
+
+    async def ws_digest(self, request: web.Request) -> web.StreamResponse:
+        """A WebSocket endpoint behind Digest auth: refused with 401 until answered."""
+        verdict = await self.digest_auth(request)
+        if verdict.status != 200:
+            return verdict
+        socket_ = web.WebSocketResponse()
+        await socket_.prepare(request)
+        await socket_.send_str("authenticated")
+        async for message in socket_:
+            if message.type == WSMsgType.TEXT:
+                await socket_.send_str(f"echo:{message.data}")
         return socket_
 
     async def ws_close(self, request: web.Request) -> web.WebSocketResponse:
@@ -742,9 +769,11 @@ class ProxyServer:
     """A minimal HTTP forward proxy that records the requests it relays.
 
     Plain ``http://`` targets are forwarded; ``CONNECT`` opens a raw tunnel.
+    With ``tls`` the proxy itself is reached over TLS (an ``https://`` proxy).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, tls: ssl.SSLContext | None = None) -> None:
+        self._tls = tls
         self.requests: list[str] = []
         #: Headers of the most recent request, lower-cased names.
         self.last_headers: dict[str, str] = {}
@@ -753,7 +782,9 @@ class ProxyServer:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.bind(("127.0.0.1", 0))
         self.port: int = self._sock.getsockname()[1]
-        self.url = f"http://127.0.0.1:{self.port}"
+        self.url = (
+            f"http://127.0.0.1:{self.port}" if tls is None else f"https://localhost:{self.port}"
+        )
         self._thread = threading.Thread(target=self._run, name="proxy-server", daemon=True)
         self._thread.start()
         assert self._ready.wait(10)
@@ -833,7 +864,9 @@ class ProxyServer:
         loop = asyncio.new_event_loop()
         self._loop = loop
         asyncio.set_event_loop(loop)
-        server = loop.run_until_complete(asyncio.start_server(self._handle, sock=self._sock))
+        server = loop.run_until_complete(
+            asyncio.start_server(self._handle, sock=self._sock, ssl=self._tls)
+        )
         self._ready.set()
         try:
             loop.run_forever()
@@ -857,6 +890,16 @@ class ProxyServer:
 @pytest.fixture
 def proxy() -> Iterator[ProxyServer]:
     server = ProxyServer()
+    yield server
+    server.close()
+
+
+@pytest.fixture
+def tls_proxy(tls_server: TLSServer) -> Iterator[ProxyServer]:
+    """An ``https://`` proxy whose certificate is signed by ``tls_server.ca_path``."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(tls_server.cert_path, tls_server.key_path)
+    server = ProxyServer(tls=context)
     yield server
     server.close()
 
