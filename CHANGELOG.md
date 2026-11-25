@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## ## 0.3.0 - 2026-11-25
 
 This release closes the gaps that were left in the test transports, in WebSockets and
 in Digest authentication.
