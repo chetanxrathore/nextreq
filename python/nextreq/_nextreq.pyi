@@ -229,6 +229,7 @@ class HttpClient:
         max_connections: int | None = 100,
         max_keepalive_connections: int | None = None,
         keepalive_expiry: float | None = 30.0,
+        uds: str | None = None,
     ) -> None: ...
     def send(
         self,

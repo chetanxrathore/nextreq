@@ -10,6 +10,7 @@ accepting them).
 from __future__ import annotations
 
 import dataclasses
+import pathlib
 import sys
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
@@ -231,7 +232,22 @@ def _static_only(engine: HttpClient, stream: ResponseStream, ws: WebSocket) -> N
     assert_type(nextreq.WebSocketError("refused").response, Response | None)
     assert_type(nextreq.WSGITransport.streams_requests, bool)
 
+    # Pagination, JSON Lines, downloads and rate limits.
+    for page in Client().paginate("https://example.com", max_pages=2):
+        assert_type(page, Response)
+        assert_type(page.links, dict[str, dict[str, str]])
+        for value in page.iter_json_lines(model=User):
+            assert_type(value, User)
+        for untyped in page.iter_json_lines():
+            assert_type(untyped, Any)
+    assert_type(Client().download("https://example.com", "file.bin", resume=True), pathlib.Path)
+    assert_type(nextreq.download("https://example.com", pathlib.Path("file.bin")), pathlib.Path)
+    assert_type(Client(rate_limit=10, uds="/tmp/app.sock").rate_limit, nextreq.RateLimit | None)
+    assert_type(nextreq.RateLimit(600, per=60, burst=5).reserve(), float)
+
     # Each of these must be a type error.
+    Client(rate_limit="fast")  # type: ignore[arg-type]
+    Client().paginate("https://example.com", max_pages="all")  # type: ignore[arg-type]
     nextreq.get("https://example.com", nonsense=True)  # type: ignore[call-overload]
     nextreq.get(42)  # type: ignore[call-overload]
     Client().get("https://example.com", timeout="soon")  # type: ignore[call-overload]
@@ -261,6 +277,11 @@ async def _static_only_async(client: AsyncClient) -> None:
 
     assert_type(await client.post("https://example.com", content=body()), Response)
     assert_type(ASGITransport(_asgi_app, lifespan=True).state, dict[str, Any])
+    async for page in client.paginate("https://example.com"):
+        assert_type(page, Response)
+        async for value in page.aiter_json_lines(model=User):
+            assert_type(value, User)
+    assert_type(await client.download("https://example.com", "file.bin"), pathlib.Path)
     await client.get("https://example.com", follow_redirects="yes")  # type: ignore[call-overload]
 
 

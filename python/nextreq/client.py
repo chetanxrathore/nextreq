@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import inspect
 import os
+import pathlib
 import re
 import threading
 import time
@@ -27,6 +28,7 @@ from collections.abc import (
     Mapping,
 )
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypedDict, TypeVar, Union, overload
+from urllib.parse import unquote_plus
 
 from . import _nextreq
 from ._nextreq import (
@@ -39,6 +41,7 @@ from ._nextreq import (
     loop_bridge,
     request_target,
 )
+from .downloads import WRITE_BATCH, Download, ProgressCallback
 from .exceptions import (
     ClientClosed,
     DecodingError,
@@ -52,6 +55,7 @@ from .exceptions import (
     WebSocketDisconnect,
     WebSocketError,
 )
+from .limits import RateLimit, RateLimitTypes, coerce_rate_limit
 from .models import (
     UNSET,
     URL,
@@ -93,6 +97,7 @@ __all__ = [
     "Transport",
     "WebSocket",
     "delete",
+    "download",
     "gather",
     "get",
     "head",
@@ -129,6 +134,9 @@ ProxyTypes = Union[str, Mapping[str, str], None]
 CertTypes = Union[str, "os.PathLike[str]", tuple[str, str], None]
 VerifyTypes = Union[bool, str, "os.PathLike[str]"]
 GatherItem = Union[Request, str, URL, tuple[str, str], tuple[str, str, Mapping[str, Any]]]
+NextPage = Callable[[Response], Any]
+"""Given a page, returns the next one: a URL, a mapping of query parameters to
+change, a :class:`Request`, or ``None`` when there are no more pages."""
 
 
 class RequestOptions(TypedDict, total=False):
@@ -483,6 +491,7 @@ def _engine_kwargs(
     max_connections: int | None,
     max_keepalive_connections: int | None,
     keepalive_expiry: float | None,
+    uds: str | os.PathLike[str] | None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "trust_env": trust_env,
@@ -493,6 +502,10 @@ def _engine_kwargs(
         "max_keepalive_connections": max_keepalive_connections,
         "keepalive_expiry": keepalive_expiry,
     }
+    if uds is not None:
+        if proxy:
+            raise ValueError("`uds` cannot be combined with `proxy`")
+        kwargs["uds"] = os.fspath(uds)
     if isinstance(verify, bool):
         kwargs["verify"] = verify
     else:
@@ -554,6 +567,7 @@ class _BaseClient:
         max_redirects: int,
         raise_for_status: bool,
         retries: RetryTypes,
+        rate_limit: RateLimitTypes,
         on_request: Any,
         on_response: Any,
         on_error: Any,
@@ -579,6 +593,7 @@ class _BaseClient:
         self._max_redirects = max_redirects
         self._raise_for_status = raise_for_status
         self._retry = _coerce_retry(retries)
+        self._rate_limit = coerce_rate_limit(rate_limit)
         self._on_request: list[Any] = _as_hook_list(on_request)
         self._on_response: list[Any] = _as_hook_list(on_response)
         self._on_error: list[Any] = _as_hook_list(on_error)
@@ -613,6 +628,11 @@ class _BaseClient:
     @property
     def retries(self) -> RetryPolicy | None:
         return self._retry
+
+    @property
+    def rate_limit(self) -> RateLimit | None:
+        """The :class:`RateLimit` this client observes, if any."""
+        return self._rate_limit
 
     @property
     def is_closed(self) -> bool:
@@ -662,7 +682,36 @@ class _BaseClient:
             target = merge_query(target, self._params)
         if params:
             target = merge_query(target, params)
+        return self._build_for(
+            method,
+            target,
+            headers=headers,
+            cookies=cookies,
+            content=content,
+            data=data,
+            json=json,
+            files=files,
+            auth=auth,
+            timeout=timeout,
+            extensions=extensions,
+        )
 
+    def _build_for(
+        self,
+        method: str,
+        target: str,
+        *,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        json: Any = None,
+        files: RequestFiles | None = None,
+        auth: AuthTypes | _Unset = UNSET,
+        timeout: TimeoutTypes | _Unset = UNSET,
+        extensions: dict[str, Any] | None = None,
+    ) -> Request:
+        """Build a request for ``target``, a complete URL that is used as it is."""
         header_list = list(self._headers._list)
         if headers:
             extra = Headers(headers)._list
@@ -923,10 +972,84 @@ def _is_retryable(exc: BaseException) -> bool:
     return isinstance(exc, TransportError) and not isinstance(exc, _NON_RETRYABLE)
 
 
+def _can_continue(
+    policy: RetryPolicy | None, attempt: int, request: Request, exc: TransportError
+) -> bool:
+    """Whether a download whose connection broke may be requested again."""
+    return (
+        policy is not None
+        and attempt < policy.max_attempts
+        and _is_retryable(exc)
+        and _can_resend(request)
+    )
+
+
 def _too_many_redirects(request: Request, limit: int) -> TooManyRedirects:
     return TooManyRedirects(
         f"Exceeded the maximum of {limit} redirects (last URL: {request.url})", request=request
     )
+
+
+def _replace_query(url: str, params: Mapping[str, Any]) -> str:
+    """``url`` with the query parameters named in ``params`` replaced."""
+    url, _, fragment = url.partition("#")
+    base, _, query = url.partition("?")
+    replaced = {unquote_plus(str(name)) for name in params}
+    kept = "&".join(
+        pair
+        for pair in query.split("&")
+        if pair and unquote_plus(pair.partition("=")[0]) not in replaced
+    )
+    target = merge_query(f"{base}?{kept}" if kept else base, params)
+    return f"{target}#{fragment}" if fragment else target
+
+
+class _Pager:
+    """Works out the request for the page after each response of ``paginate()``."""
+
+    def __init__(
+        self,
+        client: _BaseClient,
+        first: Request,
+        options: dict[str, Any],
+        next_page: NextPage | None,
+        max_pages: int | None,
+    ) -> None:
+        if max_pages is not None and max_pages < 1:
+            raise ValueError("max_pages must be >= 1")
+        self._client = client
+        self._method = first.method
+        self._first_url = str(first.url)
+        # The first URL already carries every query parameter.
+        self._options = {name: value for name, value in options.items() if name != "params"}
+        self._next_page = next_page
+        self._max_pages = max_pages
+        self._pages = 0
+        self._seen = {self._first_url}
+
+    def target(self, response: Response) -> Any:
+        """What the caller's ``next_page`` (or the ``Link`` header) points to."""
+        self._pages += 1
+        if self._max_pages is not None and self._pages >= self._max_pages:
+            return None
+        if self._next_page is not None:
+            return self._next_page(response)
+        return response.links.get("next", {}).get("url")
+
+    def request(self, response: Response, target: Any) -> Request | None:
+        """The request for ``target``, or ``None`` when the last page was reached."""
+        if not target:
+            return None
+        if isinstance(target, Request):
+            return target
+        if isinstance(target, Mapping):
+            url = _replace_query(self._first_url, target)
+        else:
+            url = str(response.url.join(str(target)))
+        if url in self._seen:  # the server sent us round in a circle
+            return None
+        self._seen.add(url)
+        return self._client._build_for(self._method, url, **self._options)
 
 
 # -- synchronous client -------------------------------------------------------
@@ -959,6 +1082,10 @@ class Client(_BaseClient):
             (default) keeps every connection, so bursts never churn sockets.
         keepalive_expiry: seconds an idle connection is kept. ``None`` keeps
             idle connections until the server closes them.
+        uds: path of a Unix domain socket to connect to instead of the host
+            in the URL (e.g. ``/var/run/docker.sock``). Not on Windows.
+        rate_limit: requests per second, or a :class:`RateLimit`. Requests
+            beyond it wait their turn. Default: no limit.
         on_request / on_response / on_error: hooks (a callable or a list).
         transport: a custom :class:`Transport` (e.g. ``MockTransport``).
         app: a WSGI application to call in-process instead of the network.
@@ -987,6 +1114,8 @@ class Client(_BaseClient):
         max_connections: int | None = 100,
         max_keepalive_connections: int | None = None,
         keepalive_expiry: float | None = 30.0,
+        uds: str | os.PathLike[str] | None = None,
+        rate_limit: RateLimitTypes = None,
         on_request: RequestHook | Iterable[RequestHook] | None = None,
         on_response: ResponseHook | Iterable[ResponseHook] | None = None,
         on_error: ErrorHook | Iterable[ErrorHook] | None = None,
@@ -1012,6 +1141,7 @@ class Client(_BaseClient):
             max_redirects=max_redirects,
             raise_for_status=raise_for_status,
             retries=retries,
+            rate_limit=rate_limit,
             on_request=on_request,
             on_response=on_response,
             on_error=on_error,
@@ -1034,6 +1164,7 @@ class Client(_BaseClient):
                         max_connections=max_connections,
                         max_keepalive_connections=max_keepalive_connections,
                         keepalive_expiry=keepalive_expiry,
+                        uds=uds,
                     )
                 )
 
@@ -1041,6 +1172,11 @@ class Client(_BaseClient):
 
     def _exchange(self, request: Request, stream: bool) -> Response:
         """One request/response exchange, with cookies and hooks applied."""
+        limit = self._rate_limit
+        if limit is not None:
+            wait = limit.reserve()
+            if wait > 0:
+                _sleep(wait)
         if self._cookies._jar or request._cookie_base is not None:
             self._apply_cookies(request)
         if self._on_request:
@@ -1335,6 +1471,119 @@ class Client(_BaseClient):
         finally:
             response.close()
 
+    # -- pagination and downloads -----------------------------------------
+
+    def paginate(
+        self,
+        url: URLTypes,
+        *,
+        method: str = "GET",
+        next_page: NextPage | None = None,
+        max_pages: int | None = None,
+        **kwargs: Unpack[RequestOptions],
+    ) -> Iterator[Response]:
+        """Iterate over the pages of a paginated endpoint, one response each.
+
+        ::
+
+            for page in client.paginate("/items", params={"per_page": 100}):
+                for item in page.json():
+                    ...
+
+        By default the next page is the ``rel="next"`` link of the ``Link``
+        header (GitHub, GitLab and many others). For any other scheme pass
+        ``next_page``, a function that takes a page and returns one of:
+
+        - a URL (absolute, or relative to the page) to fetch next;
+        - a mapping of query parameters to change on the first request, e.g.
+          ``{"cursor": page.json()["next_cursor"]}``;
+        - a :class:`Request`, for anything else (such as a cursor in a body);
+        - ``None`` (or an empty value) when there are no more pages.
+
+        Headers, auth and the other options are sent with every page.
+        ``max_pages`` stops after that many pages. Iteration also stops if a
+        page points to a URL that was already fetched.
+        """
+        build_options, send_options = _split_options(kwargs)
+        first = self.build_request(method, url, **build_options)
+        pager = _Pager(self, first, build_options, next_page, max_pages)
+        request: Request | None = first
+        while request is not None:
+            response = self.send(request, **send_options)
+            yield response
+            request = pager.request(response, pager.target(response))
+
+    def download(
+        self,
+        url: URLTypes,
+        path: str | os.PathLike[str],
+        *,
+        method: str = "GET",
+        resume: bool = False,
+        on_progress: ProgressCallback | None = None,
+        **kwargs: Unpack[RequestOptions],
+    ) -> pathlib.Path:
+        """Download ``url`` to the file ``path`` without holding it in memory.
+
+        ::
+
+            client.download("https://example.com/big.iso", "big.iso", resume=True)
+
+        The body is written to ``<path>.part`` and renamed to ``path`` when it
+        is complete, so ``path`` never holds half a file. An error status
+        raises :class:`HTTPStatusError` and writes nothing.
+
+        Args:
+            resume: continue a ``.part`` file that an earlier call left
+                behind, instead of starting again. The server is asked for
+                the missing bytes with ``Range`` and ``If-Range``; if the file
+                changed there, or the server cannot do ranges, the download
+                starts again.
+            on_progress: called with ``(bytes_on_disk, total_or_None)``.
+            retries: besides its usual meaning, the number of times a
+                connection that breaks in the middle of the body is picked
+                up again: from where it stopped, or from the start when the
+                server sent no ``ETag`` or ``Last-Modified`` to check the
+                rest against.
+
+        Returns the path of the finished file.
+        """
+        build_options, send_options = _split_options(kwargs)
+        policy = self._resolve_policy(send_options.get("retries", UNSET), method.upper())
+        send_options["raise_for_status"] = False
+        state = Download(path, resume=resume, on_progress=on_progress)
+        attempt = 0
+        while True:
+            request = self.build_request(method, url, **build_options)
+            state.prepare(request)
+            response = self.send(request, stream=True, **send_options)
+            try:
+                if response.status_code == 416 and state.ranged:
+                    state.restart()  # the part is not a prefix of the file
+                    continue
+                if response.status_code >= 400:
+                    response.read()
+                    response.raise_for_status()
+                state.begin(response)
+                for chunk in response.iter_bytes():
+                    state.write((chunk,))
+                    state.report()
+                return state.complete(response)
+            except TransportError as exc:
+                state.interrupted()
+                if not _can_continue(policy, attempt, request, exc):
+                    raise
+                attempt += 1
+                assert policy is not None
+                delay = policy.delay(attempt)
+            except BaseException:
+                state.interrupted()
+                raise
+            finally:
+                response.close()
+            if delay > 0:
+                _sleep(delay)
+
     # -- websockets -------------------------------------------------------
 
     def websocket(
@@ -1486,6 +1735,8 @@ class AsyncClient(_BaseClient):
         max_connections: int | None = 100,
         max_keepalive_connections: int | None = None,
         keepalive_expiry: float | None = 30.0,
+        uds: str | os.PathLike[str] | None = None,
+        rate_limit: RateLimitTypes = None,
         on_request: RequestHook | Iterable[RequestHook] | None = None,
         on_response: ResponseHook | Iterable[ResponseHook] | None = None,
         on_error: ErrorHook | Iterable[ErrorHook] | None = None,
@@ -1511,6 +1762,7 @@ class AsyncClient(_BaseClient):
             max_redirects=max_redirects,
             raise_for_status=raise_for_status,
             retries=retries,
+            rate_limit=rate_limit,
             on_request=on_request,
             on_response=on_response,
             on_error=on_error,
@@ -1535,6 +1787,7 @@ class AsyncClient(_BaseClient):
                         max_connections=max_connections,
                         max_keepalive_connections=max_keepalive_connections,
                         keepalive_expiry=keepalive_expiry,
+                        uds=uds,
                     )
                 )
 
@@ -1547,6 +1800,11 @@ class AsyncClient(_BaseClient):
 
     async def _exchange(self, request: Request, stream: bool) -> Response:
         """One request/response exchange, with cookies and hooks applied."""
+        limit = self._rate_limit
+        if limit is not None:
+            wait = limit.reserve()
+            if wait > 0:
+                await _asleep(wait)
         if self._cookies._jar or request._cookie_base is not None:
             self._apply_cookies(request)
         if self._on_request:
@@ -1922,6 +2180,105 @@ class AsyncClient(_BaseClient):
             yield response
         finally:
             await response.aclose()
+
+    # -- pagination and downloads -----------------------------------------
+
+    async def paginate(
+        self,
+        url: URLTypes,
+        *,
+        method: str = "GET",
+        next_page: NextPage | None = None,
+        max_pages: int | None = None,
+        **kwargs: Unpack[RequestOptions],
+    ) -> AsyncIterator[Response]:
+        """Iterate over the pages of a paginated endpoint, one response each.
+
+        ::
+
+            async for page in client.paginate("/items", params={"per_page": 100}):
+                for item in page.json():
+                    ...
+
+        See :meth:`Client.paginate`. ``next_page`` may also be a coroutine
+        function.
+        """
+        build_options, send_options = _split_options(kwargs)
+        first = self.build_request(method, url, **build_options)
+        pager = _Pager(self, first, build_options, next_page, max_pages)
+        request: Request | None = first
+        while request is not None:
+            response = await self.send(request, **send_options)
+            yield response
+            target = pager.target(response)
+            if inspect.isawaitable(target):
+                target = await target
+            request = pager.request(response, target)
+
+    async def download(
+        self,
+        url: URLTypes,
+        path: str | os.PathLike[str],
+        *,
+        method: str = "GET",
+        resume: bool = False,
+        on_progress: ProgressCallback | None = None,
+        **kwargs: Unpack[RequestOptions],
+    ) -> pathlib.Path:
+        """Download ``url`` to the file ``path`` without holding it in memory.
+
+        See :meth:`Client.download`. The file is written in a worker thread,
+        so a slow disk does not stall the event loop; ``on_progress`` is
+        called on the event loop.
+        """
+        build_options, send_options = _split_options(kwargs)
+        policy = self._resolve_policy(send_options.get("retries", UNSET), method.upper())
+        send_options["raise_for_status"] = False
+        state = Download(path, resume=resume, on_progress=on_progress)
+        loop = _get_running_loop()
+        attempt = 0
+        while True:
+            request = self.build_request(method, url, **build_options)
+            state.prepare(request)
+            response = await self.send(request, stream=True, **send_options)
+            pending: list[bytes] = []
+            try:
+                if response.status_code == 416 and state.ranged:
+                    state.restart()  # the part is not a prefix of the file
+                    continue
+                if response.status_code >= 400:
+                    await response.aread()
+                    response.raise_for_status()
+                state.begin(response)
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    pending.append(chunk)
+                    size += len(chunk)
+                    if size >= WRITE_BATCH:
+                        batch, pending, size = pending, [], 0
+                        await loop.run_in_executor(None, state.write, batch)
+                        state.report()
+                if pending:
+                    batch, pending = pending, []
+                    await loop.run_in_executor(None, state.write, batch)
+                    state.report()
+                return state.complete(response)
+            except TransportError as exc:
+                if pending:  # keep what arrived before the connection broke
+                    state.write(pending)
+                state.interrupted()
+                if not _can_continue(policy, attempt, request, exc):
+                    raise
+                attempt += 1
+                assert policy is not None
+                delay = policy.delay(attempt)
+            except BaseException:
+                state.interrupted()
+                raise
+            finally:
+                await response.aclose()
+            if delay > 0:
+                await _asleep(delay)
 
     # -- concurrency ------------------------------------------------------
 
@@ -2478,6 +2835,23 @@ def stream(
         client.stream(method, url, **kwargs) as response,
     ):
         yield response
+
+
+def download(
+    url: URLTypes,
+    path: str | os.PathLike[str],
+    *,
+    resume: bool = False,
+    on_progress: ProgressCallback | None = None,
+    verify: VerifyTypes = True,
+    cert: CertTypes = None,
+    proxy: ProxyTypes = None,
+    trust_env: bool = True,
+    **kwargs: Unpack[RequestOptions],
+) -> pathlib.Path:
+    """Download ``url`` to the file ``path``; see :meth:`Client.download`."""
+    with _one_shot_client(verify, cert, proxy, trust_env) as client:
+        return client.download(url, path, resume=resume, on_progress=on_progress, **kwargs)
 
 
 @overload

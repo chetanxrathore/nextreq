@@ -1,6 +1,34 @@
 # Changelog
 
-## ## 0.3.0 - 2026-11-25
+## 0.4.0 - 2026-11-28
+
+This release adds what a program needs around the request itself when it works with a
+real API: rate limits, pagination, JSON Lines and downloads.
+
+### Added
+
+- **Client-side rate limiting.** `rate_limit=10` (requests per second) or
+  `rate_limit=RateLimit(600, per=60, burst=5)` on either client. Requests beyond the
+  limit wait for their turn, evenly spaced. One `RateLimit` can be shared between
+  clients and threads.
+- **`paginate()`** on both clients: follows `Link: rel="next"` by default, or a
+  `next_page` function that returns a URL, query parameters, or a `Request`.
+- **`Response.links`**: the parsed `Link` header, keyed by relation, with absolute
+  URLs.
+- **JSON Lines:** `Response.iter_json_lines()` and `aiter_json_lines()`, with an
+  optional `model=` for typed items.
+- **`download()`** on both clients and as `nextreq.download()`. The body is streamed to
+  a `.part` file and renamed when complete. With `retries`, a connection that breaks
+  mid-body is continued with `Range`; with `resume=True`, a `.part` file from an
+  earlier run is continued. `If-Range` guards against a file that changed.
+- **Unix domain sockets:** `Client(uds="/var/run/docker.sock")`, for HTTP requests and
+  WebSockets (not on Windows).
+
+### Fixed
+
+- The 0.3.0 heading in this file had a doubled `##`.
+
+## 0.3.0 - 2026-11-25
 
 This release closes the gaps that were left in the test transports, in WebSockets and
 in Digest authentication.

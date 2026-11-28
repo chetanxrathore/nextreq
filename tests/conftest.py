@@ -15,8 +15,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import ssl
+import sys
+import tempfile
 import threading
 import zlib
 from collections import Counter
@@ -81,6 +84,17 @@ class LiveServer:
         self.inflight = 0
         self.max_inflight = 0
         self.request_count = 0
+        #: Downloads: the version of the file being served, and the headers
+        #: of every request for it.
+        self.file_version = "1"
+        self.file_requests: list[dict[str, str]] = []
+        #: Path of the Unix domain socket the server also listens on.
+        self.uds: str | None = None
+        self._uds_dir: str | None = None
+        if sys.platform != "win32":
+            # A short path: macOS limits socket paths to 104 bytes.
+            self._uds_dir = tempfile.mkdtemp(prefix="nextreq-")
+            self.uds = os.path.join(self._uds_dir, "http.sock")
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
@@ -105,6 +119,8 @@ class LiveServer:
         runner = web.AppRunner(self._build_app(), access_log=None)
         loop.run_until_complete(runner.setup())
         loop.run_until_complete(web.SockSite(runner, self._sock).start())
+        if self.uds is not None:
+            loop.run_until_complete(web.UnixSite(runner, self.uds).start())
         self._ready.set()
         try:
             loop.run_forever()
@@ -117,6 +133,8 @@ class LiveServer:
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread is not None:
             self._thread.join(5)
+        if self._uds_dir is not None:
+            shutil.rmtree(self._uds_dir, ignore_errors=True)
 
     def reset(self) -> None:
         self.flaky.clear()
@@ -126,6 +144,8 @@ class LiveServer:
         self.inflight = 0
         self.max_inflight = 0
         self.request_count = 0
+        self.file_version = "1"
+        self.file_requests.clear()
 
     # -- application ------------------------------------------------------
 
@@ -171,10 +191,129 @@ class LiveServer:
         r.add_get("/ws-heartbeat", self.ws_heartbeat)
         r.add_get("/ws-close", self.ws_close)
         r.add_get("/ws-digest/{user}/{password}", self.ws_digest)
+        r.add_get("/file", self.file)
+        r.add_get("/pages", self.pages)
+        r.add_get("/cursor", self.cursor)
+        r.add_get("/ndjson", self.ndjson)
         return app
 
     async def json_(self, request: web.Request) -> web.Response:
         return web.json_response({"hello": "world"})
+
+    # -- downloads --------------------------------------------------------
+
+    @staticmethod
+    def file_bytes(size: int, version: str = "1") -> bytes:
+        """The content of the downloadable file: ``size`` bytes that differ per version."""
+        block = b"".join(
+            hashlib.sha256(f"{version}:{n}".encode()).digest() for n in range(size // 32 + 1)
+        )
+        return block[:size]
+
+    async def file(self, request: web.Request) -> web.StreamResponse:
+        """A file with ``Range`` / ``If-Range`` support.
+
+        Query: ``size``; ``validator`` (``etag``, ``weak``, ``date`` or ``none``);
+        ``no_ranges`` to ignore ``Range``; ``gzip`` to compress the transfer;
+        ``drop_after=N`` with ``key`` to cut the first ``drops`` connections
+        after N bytes of the body.
+        """
+        query = request.query
+        size = int(query.get("size", "100000"))
+        version = self.file_version
+        body = self.file_bytes(size, version)
+        self.file_requests.append({k.lower(): v for k, v in request.headers.items()})
+
+        headers = {"Accept-Ranges": "bytes"}
+        kind = query.get("validator", "etag")
+        current: str | None = None
+        if kind == "etag":
+            current = headers["ETag"] = f'"v{version}"'
+        elif kind == "weak":
+            headers["ETag"] = f'W/"v{version}"'
+        elif kind == "date":
+            current = headers["Last-Modified"] = f"Wed, 0{version} Jan 2025 00:00:00 GMT"
+
+        status, start = 200, 0
+        wanted = request.headers.get("Range")
+        honoured = "no_ranges" not in query and request.headers.get("If-Range", current) == current
+        if wanted and honoured:
+            start = int(wanted.removeprefix("bytes=").rstrip("-"))
+            if start >= size:
+                return web.Response(status=416, headers={"Content-Range": f"bytes */{size}"})
+            status = 206
+            headers["Content-Range"] = f"bytes {start}-{size - 1}/{size}"
+        payload = body[start:]
+        if "gzip" in query:
+            payload = gzip.compress(payload)
+            headers["Content-Encoding"] = "gzip"
+
+        response = web.StreamResponse(status=status, headers=headers)
+        response.content_length = len(payload)
+        await response.prepare(request)
+        counter = f"file:{query.get('key', '')}"
+        if "drop_after" in query and self.flaky[counter] < int(query.get("drops", "1")):
+            self.flaky[counter] += 1
+            await response.write(payload[: int(query["drop_after"])])
+            await asyncio.sleep(0.1)  # let the client read what was sent
+            if request.transport is not None:
+                request.transport.abort()
+            return response
+        for offset in range(0, len(payload), 16384):
+            await response.write(payload[offset : offset + 16384])
+        await response.write_eof()
+        return response
+
+    # -- pagination and JSON Lines ----------------------------------------
+
+    async def pages(self, request: web.Request) -> web.Response:
+        """``Link``-header pagination: ``page`` of ``total`` (default 3)."""
+        query = request.query
+        page = int(query.get("page", "1"))
+        total = int(query.get("total", "3"))
+        headers = {}
+        if page < total or "loop" in query:
+            following = page if "loop" in query else page + 1
+            target = request.rel_url.update_query({"page": str(following)})
+            link = str(target) if "relative" in query else f"{self.url}{target}"
+            headers["Link"] = f'<{self.url}/pages?page=1>; rel="first", <{link}>; rel="next"'
+        payload = {
+            "page": page,
+            "items": [f"item-{page}-{n}" for n in range(2)],
+            "query_string": request.query_string,
+            "authorization": request.headers.get("Authorization"),
+            "x_test": request.headers.get("X-Test"),
+        }
+        return web.json_response(payload, headers=headers)
+
+    async def cursor(self, request: web.Request) -> web.Response:
+        """Cursor pagination in the body: "" -> "a" -> "b" -> end."""
+        cursor = request.query.get("cursor", "")
+        following = {"": "a", "a": "b"}.get(cursor)
+        payload = {
+            "cursor": cursor,
+            "next_cursor": following,
+            "query_string": request.query_string,
+        }
+        return web.json_response(payload)
+
+    async def ndjson(self, request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(headers={"Content-Type": "application/x-ndjson"})
+        await response.prepare(request)
+        # Lines split across chunks, a blank line, CRLF, a line separator
+        # inside a string (legal in JSON) and no newline at the end.
+        parts = (
+            b'{"id": 1, "name": "Ada"}\n{"id": 2, ',
+            b'"name": "Gr\xc3',
+            b'\xa9te"}\r\n\n  \n',
+            '{"id": 3, "name": "a\u2028b"}\n'.encode(),
+            b'{"id": 4, "name": "last"}',
+        )
+        for part in parts:
+            await response.write(part)
+            await asyncio.sleep(0.005)
+        await response.write_eof()
+        return response
 
     async def echo(self, request: web.Request) -> web.Response:
         body = await request.read()

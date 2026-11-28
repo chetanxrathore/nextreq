@@ -1522,6 +1522,8 @@ struct ClientOptions {
     max_connections: Option<usize>,
     max_keepalive_connections: Option<usize>,
     keepalive_expiry: Option<f64>,
+    /// Path of a Unix domain socket that every connection goes to.
+    uds: Option<String>,
 }
 
 fn config_error(err: impl std::fmt::Display) -> NxError {
@@ -1567,6 +1569,28 @@ fn build_inner(options: &ClientOptions) -> NxResult<Inner> {
     #[cfg(feature = "http3")]
     if options.http3 {
         builder = builder.http3_prior_knowledge();
+    }
+
+    if let Some(path) = &options.uds {
+        if !options.proxies.is_empty() {
+            return Err(config_error(
+                "`uds` cannot be combined with `proxy`: a Unix socket is a direct connection",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            // reqwest ignores the proxy settings (also those of the
+            // environment) for a client that is bound to a socket.
+            builder = builder.unix_socket(path.clone());
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            return Err(NxError::new(
+                ErrorKind::UnsupportedProtocol,
+                "Unix domain sockets are not available on this platform",
+            ));
+        }
     }
 
     if !options.trust_env {
@@ -1654,6 +1678,7 @@ impl HttpClient {
             tls: inner.ws_tls.clone(),
             proxies: self.options.proxies.clone(),
             trust_env: self.options.trust_env,
+            uds: self.options.uds.clone(),
             connect_timeout: timeout.and_then(|t| t.get().timeouts().connect),
             max_message_size,
             compression,
@@ -1780,6 +1805,7 @@ impl HttpClient {
         max_connections = Some(100),
         max_keepalive_connections = None,
         keepalive_expiry = Some(30.0),
+        uds = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
@@ -1796,6 +1822,7 @@ impl HttpClient {
         max_connections: Option<usize>,
         max_keepalive_connections: Option<usize>,
         keepalive_expiry: Option<f64>,
+        uds: Option<String>,
     ) -> PyResult<Self> {
         if let Some(expiry) = keepalive_expiry {
             if !expiry.is_finite() || expiry < 0.0 {
@@ -1819,6 +1846,7 @@ impl HttpClient {
             max_connections,
             max_keepalive_connections,
             keepalive_expiry,
+            uds,
         };
         // Reads certificate files; keep the interpreter free meanwhile.
         let built = py.detach(|| {
@@ -2133,6 +2161,7 @@ mod tests {
             max_connections: Some(4),
             max_keepalive_connections: None,
             keepalive_expiry: None,
+            uds: None,
         };
         let err = build_inner(&options).err().unwrap();
         assert_eq!(err.kind, ErrorKind::LocalProtocolError);

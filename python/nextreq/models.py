@@ -19,6 +19,7 @@ from collections.abc import (
     AsyncGenerator,
     AsyncIterable,
     AsyncIterator,
+    Callable,
     Iterable,
     Iterator,
     Mapping,
@@ -1257,6 +1258,43 @@ _CHARSET_RE: Final = re.compile(r"charset\s*=\s*\"?([^\s;\"]+)", re.IGNORECASE)
 _LINE_BREAK_RE: Final = re.compile(r"\r\n|\n|\r")
 
 
+_LINK_TARGET_RE: Final = re.compile(r"\s*<([^>]*)>")
+_LINK_PARAM_RE: Final = re.compile(
+    r"""\s*;\s*([^\s=;,]+)(?:\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^\s;,]*)))?"""
+)
+_QUOTED_PAIR_RE: Final = re.compile(r"\\(.)")
+
+
+def parse_link_header(value: str) -> list[dict[str, str]]:
+    """Parse a ``Link`` header (RFC 8288) into one dict per link.
+
+    Each dict has ``"url"`` plus the link's parameters with lower-cased names,
+    e.g. ``{"url": "https://api.example.com/items?page=2", "rel": "next"}``.
+    """
+    links: list[dict[str, str]] = []
+    position = 0
+    while position < len(value):
+        target = _LINK_TARGET_RE.match(value, position)
+        if target is not None:
+            link = {"url": target.group(1).strip()}
+            position = target.end()
+            while (param := _LINK_PARAM_RE.match(value, position)) is not None:
+                quoted = param.group(2)
+                if quoted is not None:
+                    text = _QUOTED_PAIR_RE.sub(r"\1", quoted)
+                else:
+                    text = param.group(3) or ""
+                # The first occurrence of a parameter wins (RFC 8288, section 3.3).
+                link.setdefault(param.group(1).lower(), text)
+                position = param.end()
+            links.append(link)
+        comma = value.find(",", position)
+        if comma == -1:
+            break
+        position = comma + 1
+    return links
+
+
 def _charset_from(content_type: str | None) -> str | None:
     if not content_type:
         return None
@@ -1304,6 +1342,18 @@ class _LineSplitter:
             rest = rest[:-1]
             return [rest]
         return [rest] if rest else []
+
+
+def _line_decoder(response: Response, model: Any) -> Callable[[str], Any]:
+    """The function that turns one line of a JSON Lines body into a value."""
+    if model is None:
+        return _json.loads
+    from .parsing import parse_json
+
+    def decode(line: str) -> Any:
+        return parse_json(line.encode("utf-8"), model, response=response)
+
+    return decode
 
 
 class Response:
@@ -1465,6 +1515,27 @@ class Response:
         return out
 
     @property
+    def links(self) -> dict[str, dict[str, str]]:
+        """The ``Link`` headers, keyed by relation (``rel``).
+
+        ::
+
+            next_url = response.links["next"]["url"]
+
+        URLs are resolved against the URL of the response. A link without a
+        ``rel`` is keyed by its URL.
+        """
+        links: dict[str, dict[str, str]] = {}
+        base = self.url if self.request is not None else None
+        for header in self.headers.get_list("link"):
+            for link in parse_link_header(header):
+                if base is not None:
+                    link["url"] = str(base.join(link["url"]))
+                for key in link.get("rel", "").lower().split() or [link["url"]]:
+                    links.setdefault(key, link)
+        return links
+
+    @property
     def encoding(self) -> str:
         """Text encoding: explicit, else ``charset`` from Content-Type, else UTF-8."""
         if self._encoding is None:
@@ -1608,6 +1679,21 @@ class Response:
             yield from splitter.feed(text)
         yield from splitter.flush()
 
+    @overload
+    def iter_json_lines(self, *, model: None = None) -> Iterator[Any]: ...
+    @overload
+    def iter_json_lines(self, *, model: type[T]) -> Iterator[T]: ...
+    def iter_json_lines(self, *, model: Any = None) -> Iterator[Any]:
+        """Iterate over a JSON Lines (NDJSON) body: one parsed value per line.
+
+        Blank lines are skipped. With ``model=`` each line is validated into
+        that type, as :meth:`json` does for a whole body.
+        """
+        decode = _line_decoder(self, model)
+        for line in self.iter_lines():
+            if line and not line.isspace():
+                yield decode(line)
+
     def iter_sse(self) -> Iterator[SSEEvent]:
         """Iterate over Server-Sent Events.
 
@@ -1717,6 +1803,17 @@ class Response:
                 yield line
         for line in splitter.flush():
             yield line
+
+    @overload
+    def aiter_json_lines(self, *, model: None = None) -> AsyncIterator[Any]: ...
+    @overload
+    def aiter_json_lines(self, *, model: type[T]) -> AsyncIterator[T]: ...
+    async def aiter_json_lines(self, *, model: Any = None) -> AsyncIterator[Any]:
+        """Iterate over a JSON Lines (NDJSON) body: one parsed value per line."""
+        decode = _line_decoder(self, model)
+        async for line in self.aiter_lines():
+            if line and not line.isspace():
+                yield decode(line)
 
     async def aiter_sse(self) -> AsyncIterator[SSEEvent]:
         """Iterate over Server-Sent Events, parsed by the Rust core."""

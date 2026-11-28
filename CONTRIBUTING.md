@@ -60,6 +60,8 @@ src/                  Rust core, compiled to the `nextreq._nextreq` extension
 python/nextreq/       the public Python API
   client.py           Client, AsyncClient, module-level helpers, gather()
   models.py           Request, Response, Headers, URL, Cookies
+  limits.py           RateLimit (client-side rate limiting)
+  downloads.py        bookkeeping for download(): .part files, Range / If-Range
   parsing.py          typed JSON parsing (Pydantic, dataclasses, msgspec)
   testing.py          MockTransport, ASGI and WSGI transports
   otel.py             OpenTelemetry hooks

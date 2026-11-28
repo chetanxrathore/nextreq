@@ -298,6 +298,23 @@ async fn tcp_connect(url: &Url) -> NxResult<TcpStream> {
     Ok(stream)
 }
 
+/// Connect to a Unix domain socket instead of the host named in the URL.
+#[cfg(unix)]
+async fn unix_connect(path: &str) -> NxResult<BoxIo> {
+    let stream = tokio::net::UnixStream::connect(path)
+        .await
+        .map_err(connect_error)?;
+    Ok(Box::new(stream))
+}
+
+#[cfg(not(unix))]
+async fn unix_connect(_path: &str) -> NxResult<BoxIo> {
+    Err(NxError::new(
+        ErrorKind::UnsupportedProtocol,
+        "Unix domain sockets are not available on this platform",
+    ))
+}
+
 /// Wrap `stream` in TLS, verifying the certificate against the host of `url`.
 async fn tls_connect(url: &Url, stream: BoxIo, tls: Arc<rustls::ClientConfig>) -> NxResult<BoxIo> {
     let host = url
@@ -392,12 +409,14 @@ async fn http_tunnel(
 
 async fn open_transport(
     url: &Url,
+    uds: Option<&str>,
     proxy: Option<&Url>,
     tls: Arc<rustls::ClientConfig>,
 ) -> NxResult<BoxIo> {
-    let stream: BoxIo = match proxy {
-        None => Box::new(tcp_connect(url).await?),
-        Some(proxy) => match proxy.scheme() {
+    let stream: BoxIo = match (uds, proxy) {
+        (Some(path), _) => unix_connect(path).await?,
+        (None, None) => Box::new(tcp_connect(url).await?),
+        (None, Some(proxy)) => match proxy.scheme() {
             "http" | "https" => http_tunnel(proxy, url, &tls).await?,
             "socks5" | "socks5h" => {
                 let socks = yawc::Proxy::socks5(proxy.clone())
@@ -438,6 +457,9 @@ pub struct ConnectOptions {
     pub tls: Arc<rustls::ClientConfig>,
     pub proxies: Vec<(String, String)>,
     pub trust_env: bool,
+    /// Connect to this Unix domain socket; the URL then only names the
+    /// `Host` header and the TLS server name, and proxies are not used.
+    pub uds: Option<String>,
     pub connect_timeout: Option<Duration>,
     pub max_message_size: Option<usize>,
     pub compression: bool,
@@ -700,9 +722,18 @@ pub async fn connect(options: ConnectOptions) -> NxResult<Opened> {
             format!("invalid WebSocket URL {:?}: missing host", options.url),
         ));
     }
-    let proxy = proxy_for(&url, &options.proxies, options.trust_env)?;
+    let proxy = match options.uds {
+        Some(_) => None,
+        None => proxy_for(&url, &options.proxies, options.trust_env)?,
+    };
     let opening = async {
-        let io = open_transport(&url, proxy.as_ref(), options.tls.clone()).await?;
+        let io = open_transport(
+            &url,
+            options.uds.as_deref(),
+            proxy.as_ref(),
+            options.tls.clone(),
+        )
+        .await?;
         handshake(&options, &url, io).await
     };
     match options.connect_timeout {
@@ -1114,6 +1145,7 @@ mod tests {
             ),
             proxies: Vec::new(),
             trust_env: false,
+            uds: None,
             connect_timeout: Some(Duration::from_secs(1)),
             max_message_size: None,
             compression: false,

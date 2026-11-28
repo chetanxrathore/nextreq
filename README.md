@@ -34,6 +34,8 @@ print(r.json(), r.http_version, r.elapsed.total)
 - **Safe by default.** Timeouts on every phase, TLS verification, bounded
   redirects, credentials dropped on cross-origin redirects.
 - **Resilient.** Built-in retries with exponential backoff, jitter and `Retry-After`.
+- **Made for real APIs.** Client-side rate limits, `paginate()`, JSON Lines, and
+  downloads that resume where a broken connection stopped.
 - **Realtime.** WHATWG-compliant SSE parser in Rust, WebSockets (sync and async, with
   compression and proxy support), and `gather()` for bounded-concurrency fan-out.
 - **Streaming both ways.** Downloads and uploads are streamed: generators and open
@@ -46,7 +48,7 @@ print(r.json(), r.http_version, r.elapsed.total)
   zstd decoding, proxies, optional HTTP/3.
 - **Zero mandatory dependencies.** Python 3.10+, one abi3 wheel per platform.
 
-> **Status:** young but thoroughly tested: 403 Python tests and 45 Rust tests, run
+> **Status:** young but thoroughly tested: 489 Python tests and 45 Rust tests, run
 > on CPython 3.10 (against the abi3 wheel) and 3.14, plus a threaded smoke test on
 > free-threaded CPython 3.14t. What it does not do is listed under
 > [Limitations](#limitations).
@@ -100,10 +102,19 @@ asyncio.run(main())
 
 Both clients accept `base_url`, `headers`, `params`, `cookies` (a persistent jar),
 `auth`, `timeout`, `follow_redirects` (default `True`, at most 10 hops),
-`raise_for_status`, `retries`, `verify`, `cert`, `proxy`, `trust_env`, `http2`,
-`max_connections` and `keepalive_expiry`. Every request method accepts per-request
-overrides. The module-level helpers (`nextreq.get`, `post`, `put`, `patch`, `delete`,
-`head`, `options`, `request`, `stream`) share a keep-alive pool but never share cookies.
+`raise_for_status`, `retries`, `rate_limit`, `verify`, `cert`, `proxy`, `trust_env`,
+`http2`, `uds`, `max_connections` and `keepalive_expiry`. Every request method accepts
+per-request overrides. The module-level helpers (`nextreq.get`, `post`, `put`, `patch`,
+`delete`, `head`, `options`, `request`, `stream`, `download`) share a keep-alive pool
+but never share cookies.
+
+To talk to a service on a Unix domain socket, such as the Docker daemon, pass its path.
+The host in the URL is then only used for the `Host` header (not on Windows):
+
+```python
+with nextreq.Client(uds="/var/run/docker.sock", base_url="http://docker") as client:
+    print(client.get("/version").json())
+```
 
 ### Uploads
 
@@ -243,6 +254,16 @@ The SSE parser is implemented in Rust, follows the WHATWG event-stream rules (CR
 line endings, comments, multi-line `data`, persistent `id`, `retry`, BOM) and yields
 immutable `SSEEvent(event, data, id, retry)` objects.
 
+For APIs that stream JSON Lines (NDJSON), one JSON value per line:
+
+```python
+with client.stream("POST", "/api/generate", json=payload) as response:
+    for item in response.iter_json_lines():           # or model=Chunk for typed items
+        print(item["response"], end="")
+```
+
+`aiter_json_lines()` is the async twin. Blank lines are skipped.
+
 ### WebSockets
 
 ```python
@@ -298,6 +319,71 @@ async with nextreq.AsyncClient(base_url="https://api.example.com") as client:
 Results come back in input order. Items may be URLs, `Request` objects or
 `(method, url[, options])` tuples, and the full client pipeline (redirects, cookies,
 retries, hooks) applies to each.
+
+### Rate limits
+
+Stay under an API's limit instead of collecting `429` responses:
+
+```python
+client = nextreq.AsyncClient(rate_limit=10)                       # 10 requests per second
+client = nextreq.Client(rate_limit=nextreq.RateLimit(600, per=60, burst=5))
+```
+
+Requests beyond the limit wait for their turn, in order. They are spaced evenly (one
+every `per / rate` seconds), so the limit holds over any window, not only on average;
+`burst` lets that many leave back to back after an idle period. Every request that
+reaches the server counts, including retries and redirects. One `RateLimit` object can
+be given to several clients, sync or async, in any number of threads, and they then
+share one budget. The wait is not part of the request's timeout, and WebSocket
+handshakes are not counted.
+
+### Pagination
+
+```python
+for page in client.paginate("/repos/python/cpython/issues", params={"per_page": 100}):
+    for issue in page.json():
+        ...
+```
+
+By default `paginate()` follows the `rel="next"` link of the `Link` header, as used by
+GitHub, GitLab and many others, and yields one response per page. Pages are fetched
+only as you iterate. For other schemes, `next_page` takes a page and returns where the
+next one is:
+
+```python
+def next_page(page):
+    cursor = page.json().get("next_cursor")
+    return {"cursor": cursor} if cursor else None     # query parameters to change
+
+async for page in aclient.paginate("/v1/events", next_page=next_page, max_pages=50):
+    ...
+```
+
+`next_page` may return a URL, a mapping of query parameters, a `Request` (for example
+when the cursor goes in a JSON body) or `None` at the end. Headers, auth and the other
+options are sent with every page. `response.links` gives the parsed `Link` header on
+any response: `response.links["next"]["url"]`.
+
+### Downloads
+
+```python
+path = client.download("https://example.com/big.iso", "big.iso", resume=True, retries=3)
+```
+
+The body is streamed to `big.iso.part` and renamed when it is complete, so `big.iso`
+never holds half a file, and an error status writes nothing.
+
+- `retries` also covers a connection that breaks in the middle of the body: the rest is
+  requested with `Range` and appended.
+- `resume=True` continues a `.part` file left by an earlier run of your program.
+- Both send `If-Range` with the `ETag` (or `Last-Modified`) of the first answer. If the
+  file changed on the server, or the server cannot do ranges, the download starts
+  again, so two versions are never mixed. Without such a header there is nothing to
+  check against, and the download also starts again.
+- `on_progress(bytes_on_disk, total_or_None)` reports progress.
+
+`await aclient.download(...)` writes the file in a worker thread, and
+`nextreq.download(url, path)` needs no client.
 
 ### Testing without a network
 
@@ -463,6 +549,10 @@ dominates and the gaps narrow. What stays is the lower CPU cost per request.
 | Server-Sent Events | ✅ built in | — | extra package | extra package |
 | WebSockets | ✅ sync + async | — | extra package | ✅ async |
 | Bounded-concurrency `gather()` | ✅ | — | — | — |
+| Client-side rate limiting | ✅ | — | — | — |
+| Pagination | ✅ `paginate()` | `links` only | `links` only | `links` only |
+| Resumable downloads to a file | ✅ | — | — | — |
+| Unix domain sockets | ✅ | extra package | ✅ | ✅ |
 | Mock transport built in | ✅ | extra package | ✅ basic | extra package |
 | In-process ASGI / WSGI | ✅ / ✅ | — | ✅ / ✅ | — |
 | Per-phase timings | ✅ | total only | total only | via tracing hooks |
@@ -528,6 +618,9 @@ with ThreadPoolExecutor(max_workers=20) as pool:
 | `proxies={"https": url}` (requests) | `proxy=url` or `proxy={"https://": url}` |
 | `verify="ca.pem"`, `cert=("c.pem", "k.pem")` | identical |
 | `HTTPAdapter(max_retries=Retry(...))` | `retries=3` or `retries=RetryPolicy(...)` |
+| `r.links["next"]["url"]` | identical (URLs are made absolute); or `client.paginate(url)` |
+| `aiolimiter` / `ratelimit` around each call | `rate_limit=10` |
+| `httpx.HTTPTransport(uds=path)` / `aiohttp.UnixConnector(path)` | `nextreq.Client(uds=path)` |
 | `httpx.MockTransport(handler)` / `responses` / `respx` | `nextreq.MockTransport()` |
 | `httpx.ASGITransport(app=app)` | `nextreq.AsyncClient(app=app)` |
 | `requests.exceptions.ConnectionError`, `Timeout` | `nextreq.ConnectError` (also builtin `ConnectionError`), `nextreq.TimeoutException` (also builtin `TimeoutError`) |
@@ -589,6 +682,8 @@ Known gaps, in rough priority order:
   used in the child, and forking while another thread is in the middle of a request
   is not supported (CPython itself warns about forking a multi-threaded process).
 - **The Public Suffix List is compiled in**, so it is as fresh as the release.
+- **Unix domain sockets are not available on Windows**; `uds=` raises
+  `UnsupportedProtocol` there.
 
 ## Development
 

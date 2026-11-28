@@ -33,6 +33,7 @@ from .client import (
     Transport,
     WebSocket,
     delete,
+    download,
     gather,
     get,
     head,
@@ -73,6 +74,7 @@ from .exceptions import (
     WriteError,
     WriteTimeout,
 )
+from .limits import RateLimit
 from .models import URL, Cookies, Elapsed, Headers, Request, RequestStream, Response, SSEEvent
 from .testing import ASGITransport, MockRouteNotFound, MockTransport, WSGITransport
 
@@ -113,6 +115,7 @@ __all__ = [
     "PoolTimeout",
     "ProtocolError",
     "ProxyError",
+    "RateLimit",
     "ReadError",
     "ReadTimeout",
     "RemoteProtocolError",
@@ -140,6 +143,7 @@ __all__ = [
     "WriteTimeout",
     "__version__",
     "delete",
+    "download",
     "gather",
     "get",
     "head",
